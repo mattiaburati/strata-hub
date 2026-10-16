@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "strata_dir": "../Strata",
+  "python": "../Strata/.venv/Scripts/python.exe",
+  "models_dir": "../Strata-data",
+  "profiles_dir": "../Strata",
+  "data_dir": "./data",
+  "pricing_file": "./data/qwen_pricing.json"
+}

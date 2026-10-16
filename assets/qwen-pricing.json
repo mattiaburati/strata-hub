@@ -1,0 +1,18 @@
+{
+  "model": "qwen3.8-flash",
+  "provider": "Alibaba Cloud Model Studio",
+  "currency": "USD",
+  "per_tokens": 1000000,
+  "input_per_million": "0.113",
+  "implicit_cache_input_per_million": "0.014",
+  "output_per_million": "0.382",
+  "verified_on": "2026-10-15",
+  "source_url": "https://www.alibabacloud.com/help/en/model-studio/qwen3-8-flash",
+  "fx": {
+    "base": "EUR",
+    "quote": "USD",
+    "usd_per_eur": "1.1195",
+    "date": "2026-10-14",
+    "source_url": "https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html"
+  }
+}
