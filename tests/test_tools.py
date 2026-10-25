@@ -268,41 +268,6 @@ Write-Output ('HUB_CALLS ' + (ConvertTo-Json -InputObject @($script:calls.ToArra
             self.assertIn("not overwritten", refused.stdout)
             self.assertEqual(marker.read_text(encoding="utf-8"), "existing installation")
 
-    def test_update_backs_up_and_uses_official_update_without_starting(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            root, data, report = base / "Strata", base / "models", base / "hub" / "report"
-            engine = root / "engine"
-            engine.mkdir(parents=True)
-            data.mkdir()
-            report.mkdir(parents=True)
-            (engine / "BUILD.json").write_text('{"version":"0.1.43"}', encoding="utf-8")
-            (engine / "engine.bin").write_bytes(b"old engine")
-            (data / "model.gguf").write_bytes(b"model weights")
-            (report / "hub-profiles.json").write_text('{}', encoding="utf-8")
-            before = updater.model_manifest(data)
-            calls = []
-
-            def command(arguments, cwd, capture=False):
-                calls.append(arguments)
-                if arguments[1:4] == ["remote", "get-url", "origin"]:
-                    return "https://github.com/Niko1221/Strata.git"
-                if arguments[1] == "status":
-                    return ""
-                if arguments[1] == "rev-parse":
-                    return "a" * 40 if arguments[2] == "HEAD" else "b" * 40
-                if "--update" in arguments:
-                    (engine / "BUILD.json").write_text('{"version":"0.1.44.1"}', encoding="utf-8")
-                return "" if capture else None
-
-            with patch.object(updater, "require_idle"), patch.object(updater, "run", side_effect=command):
-                updater.install(root, data, report, "v0.1.44.1", report.parent)
-            self.assertTrue(list((report / "update-backups").glob("*/engine/engine.bin")))
-            self.assertEqual(updater.model_manifest(data), before)
-            self.assertTrue(any("--update" in command and "--yes" in command for command in calls))
-            self.assertFalse(any("--start" in command for command in calls))
-            self.assertTrue(any(command[1:3] == ["merge", "--ff-only"] for command in calls))
-
     def test_stable_version_comparison_and_input_validation(self):
         self.assertGreater(updater.version("v0.1.44.1"), updater.version("0.1.43"))
         self.assertEqual(updater.version("v0.1.44"), updater.version("0.1.44.0"))

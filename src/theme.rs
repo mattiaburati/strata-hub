@@ -5,7 +5,7 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::*,
-        Input::KeyboardAndMouse::GetFocus,
+        Input::KeyboardAndMouse::{GetFocus, IsWindowEnabled},
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::*,
     },
@@ -25,10 +25,10 @@ pub fn icon(size: i32) -> HICON {
         ) as HICON
     }
 }
-pub const INPUT: u32 = 0x00201710;
-pub const BORDER: u32 = 0x0049392c;
-const SIDE_BG: u32 = 0x00201812;
-const ACTIVE: u32 = 0x00353e25;
+pub const INPUT: u32 = 0x00221b16;
+pub const BORDER: u32 = 0x004a3d33;
+const SIDE_BG: u32 = 0x001e1814;
+const ACTIVE: u32 = 0x003a4430;
 
 pub fn rounded(dc: HDC, r: RECT, color: u32, border: Option<u32>, radius: i32) {
     unsafe {
@@ -85,6 +85,8 @@ pub fn dispose(hwnd: HWND) {
             "StrataHubView",
             "StrataMetricTab",
             "StrataNoProfiles",
+            "StrataDeepSeek",
+            "StrataExperimentalAvailable",
         ] {
             RemovePropW(hwnd, wide(name).as_ptr());
         }
@@ -151,16 +153,23 @@ pub fn badge(dc: HDC, bounds: RECT, label: &str, color: u32, font: HFONT) {
         font,
     );
 }
-pub fn status(dc: HDC, width: i32, label: &str, color: u32, speed: Option<f64>, font: HFONT) {
-    let speed_rect = rect(width - 312, 29, 144, 30);
+pub fn status(
+    dc: HDC,
+    width: i32,
+    label: &str,
+    color: u32,
+    rates: &str,
+    prefill: &str,
+    font: HFONT,
+) {
+    badge(dc, rect(width - 710, 29, 194, 30), prefill, WHITE, font);
+    let speed_rect = rect(width - 506, 29, 338, 30);
     rounded(dc, speed_rect, PANEL, Some(BORDER), 14);
     text(
         dc,
-        rect(speed_rect.left + 12, speed_rect.top, 126, 30),
-        &speed
-            .map(|v| format!("{v:.1} token/s"))
-            .unwrap_or_else(|| "– token/s".into()),
-        if speed.is_some() { WHITE } else { MUTED },
+        rect(speed_rect.left + 12, speed_rect.top, 314, 30),
+        rates,
+        WHITE,
         font,
     );
     let r = rect(width - 158, 29, 130, 30);
@@ -247,8 +256,29 @@ unsafe extern "system" fn checkbox_proc(
                 DeleteObject(pen);
             }
             if focused {
-                DrawFocusRect(dc, &rect(0, 3, 18, 20));
+                DrawFocusRect(dc, &rect(0, 2, bounds.right, bounds.bottom - 4));
             }
+            let mut label = vec![0u16; GetWindowTextLengthW(hwnd).max(0) as usize + 1];
+            GetWindowTextW(hwnd, label.as_mut_ptr(), label.len() as i32);
+            let font = GetPropW(GetParent(hwnd), wide("StrataFont").as_ptr()) as HFONT;
+            let old = SelectObject(dc, font);
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(
+                dc,
+                if IsWindowEnabled(hwnd) != 0 {
+                    WHITE
+                } else {
+                    MUTED
+                },
+            );
+            DrawTextW(
+                dc,
+                label.as_ptr(),
+                -1,
+                &mut rect(28, 0, bounds.right - 28, bounds.bottom),
+                DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+            SelectObject(dc, old);
             EndPaint(hwnd, &paint);
             return 0;
         }
@@ -368,9 +398,11 @@ pub fn draw_item(parent: HWND, item: &DRAWITEMSTRUCT) -> LRESULT {
             115 => page == 5,
             101..=104 => GetPropW(parent, wide("StrataMetricTab").as_ptr()) as usize == id - 100,
             310..=312 => crate::hub_ui::active_section(parent) == id - 310,
+            314 => crate::hub_ui::active_section(parent) == 3,
+            318 => crate::hub_ui::active_section(parent) == 4,
             _ => false,
         };
-        let tab = (101..=104).contains(&id) || (310..=312).contains(&id);
+        let tab = (101..=104).contains(&id) || (310..=312).contains(&id) || matches!(id, 314 | 318);
         let nav = (110..=115).contains(&id) || id == 306;
         let primary = id == 301
             || (id == 303 && crate::hub_ui::modified(parent))

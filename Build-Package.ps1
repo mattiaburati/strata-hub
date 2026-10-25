@@ -51,11 +51,11 @@ try {
     New-Item -ItemType Directory -Path $source, $release | Out-Null
     # Keep individual paths explicit so new local JSON/configuration files never enter a package implicitly.
     $files = @('Cargo.toml', 'Cargo.lock', 'build.rs', '.gitignore', '.gitattributes', 'README.md',
-        'PUBLISHING.md', 'Build-Package.ps1', 'hub-settings.example.json', 'Start-StrataHub.bat', 'Open-Settings.bat',
-        'src/config.rs', 'src/data.rs', 'src/hub_ui.rs', 'src/installer.rs', 'src/jobs.rs', 'src/launch.rs',
+        'PUBLISHING.md', 'ADVANCED.md', 'UPDATES.md', 'Build-Package.ps1', 'hub-settings.example.json', 'Start-StrataHub.bat', 'Open-Settings.bat',
+        'src/config.rs', 'src/data.rs', 'src/engine_options.rs', 'src/hub_ui.rs', 'src/installer.rs', 'src/jobs.rs', 'src/launch.rs',
         'src/main.rs', 'src/models_ui.rs', 'src/profiles.rs', 'src/resources.rs', 'src/settings_ui.rs', 'src/theme.rs', 'src/tools_ui.rs',
-        'scripts/agents.py', 'scripts/model_library.py', 'scripts/update_strata.py', 'scripts/install_strata.ps1', 'scripts/Export-LogoIcon.ps1',
-        'tests/test_tools.py', 'assets/schema.sql', 'assets/qwen-pricing.json', 'assets/logo-prompt.md',
+        'scripts/agents.py', 'scripts/model_library.py', 'scripts/update_strata.py', 'scripts/calibrate_model.py', 'scripts/install_strata.ps1', 'scripts/Export-LogoIcon.ps1',
+        'tests/test_tools.py', 'tests/test_updates.py', 'assets/schema.sql', 'assets/qwen-pricing.json', 'assets/logo-prompt.md',
         'assets/strata-hub-logo.png', 'assets/strata-hub.ico')
     foreach ($name in $files) {
         $target = Join-Path $source $name

@@ -47,6 +47,19 @@ impl Job {
     pub fn status(&self) -> Status {
         self.state.lock().expect("Job mutex poisoned").clone()
     }
+    pub fn fail(&self, message: String) {
+        let mut state = self.state.lock().expect("Job mutex poisoned");
+        state.error = true;
+        state.message = message;
+    }
+    pub fn finish(&self, message: String) {
+        let mut state = self.state.lock().expect("Job mutex poisoned");
+        state.error = false;
+        state.message = message;
+    }
+    pub fn tag(&self, key: &str, value: Value) {
+        self.state.lock().expect("Job mutex poisoned").data[key] = value;
+    }
     pub fn start(
         &self,
         hwnd: HWND,

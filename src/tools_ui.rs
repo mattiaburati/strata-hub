@@ -95,6 +95,7 @@ pub fn sync(
     port: Option<u16>,
     context: Option<&str>,
     vision: Option<bool>,
+    calibrating: bool,
 ) {
     unsafe {
         for (id, enabled) in [
@@ -109,7 +110,10 @@ pub fn sync(
             (RELEASE, updates.data["url"].is_string()),
             (SCAN, !agents.busy && port.is_some()),
         ] {
-            EnableWindow(GetDlgItem(hwnd, id as i32), enabled as i32);
+            EnableWindow(
+                GetDlgItem(hwnd, id as i32),
+                (enabled && !calibrating) as i32,
+            );
         }
         for i in 0..AGENTS.len() {
             let row = &agents.data["agents"][i];
@@ -142,7 +146,7 @@ pub fn sync(
             for (action, enabled) in [(0, found && !installed), (1, installed), (2, launch)] {
                 EnableWindow(
                     GetDlgItem(hwnd, (710 + i * 10 + action) as i32),
-                    (enabled && !agents.busy && port.is_some()) as i32,
+                    (enabled && !agents.busy && !calibrating && port.is_some()) as i32,
                 );
             }
         }
@@ -183,7 +187,7 @@ pub fn paint_updates(
     text(
         dc,
         rect(52, 128, width - 340, 34),
-        "Strata releases",
+        "Strata engine updates",
         WHITE,
         fonts[2],
     );
@@ -205,12 +209,12 @@ pub fn paint_updates(
     for (x, label, value) in [
         (
             52,
-            "INSTALLED",
+            "INSTALLED ENGINE",
             status.data["current"].as_str().unwrap_or(installed),
         ),
         (
             width / 2,
-            "LATEST STABLE",
+            "LATEST ENGINE FOR THIS PC",
             status.data["latest"].as_str().unwrap_or("Not checked"),
         ),
     ] {
@@ -258,7 +262,7 @@ pub fn paint_updates(
     text(
         dc,
         rect(220, height - 90, width - 248, 40),
-        "Stable releases · Manual installation",
+        "Signed engine feed · Stable source · Manual installation",
         MUTED,
         fonts[0],
     );

@@ -153,11 +153,84 @@ pub struct Snapshot {
     pub model: String,
     pub phase: String,
     pub speed: Option<f64>,
+    pub speed_mean: Option<f64>,
+    pub prefill_speed: Option<f64>,
+    pub last_speed: Option<f64>,
     pub generated: Option<i64>,
     pub slots: u32,
     pub memory: crate::resources::Memory,
     pub updated: f64,
     pub error: String,
+}
+impl Snapshot {
+    pub fn apply_live(&mut self, value: &Value) -> Result<()> {
+        let live = &value["live"];
+        let rate = |value: &Value| -> Result<Option<f64>> {
+            if value.is_null() {
+                return Ok(None);
+            }
+            let rate = value
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .ok_or("Invalid token rate")?;
+            Ok(Some(rate))
+        };
+        self.model = value["engine"]["model"]
+            .as_str()
+            .ok_or("Missing loaded model")?
+            .into();
+        self.phase = live["phase"]
+            .as_str()
+            .unwrap_or(live["state"].as_str().unwrap_or(""))
+            .into();
+        self.speed = if live["state"] == "generating" {
+            rate(&live["tok_s"])?
+        } else {
+            None
+        };
+        self.speed_mean = if live["state"] == "generating" {
+            rate(&live["tok_s_mean"])?
+        } else {
+            None
+        };
+        self.prefill_speed = if live["state"] == "reading" {
+            rate(&live["prefill_tok_s_mean"])?
+        } else {
+            None
+        };
+        self.last_speed = rate(&value["requests"][0]["decode_tok_s"])?;
+        self.generated = live["generated"].as_i64();
+        self.slots = u32::try_from(live["parallel"].as_u64().unwrap_or(1))?.max(1);
+        self.online = true;
+        self.error.clear();
+        self.updated = now();
+        Ok(())
+    }
+    pub fn rate_label(&self, now: f64) -> String {
+        if !self.online || !self.error.is_empty() || now - self.updated > 3.0 {
+            return "Live — · Mean — t/s".into();
+        }
+        if self.phase == "idle" {
+            return self
+                .last_speed
+                .map(|n| format!("Last request {n:.1} t/s"))
+                .unwrap_or_else(|| "No completed request".into());
+        }
+        let value = |n: Option<f64>| n.map(|n| format!("{n:.1}")).unwrap_or_else(|| "—".into());
+        format!(
+            "Live {} · Mean {} t/s",
+            value(self.speed),
+            value(self.speed_mean)
+        )
+    }
+    pub fn prefill_label(&self, now: f64) -> String {
+        let speed = self
+            .prefill_speed
+            .filter(|_| self.online && self.error.is_empty() && now - self.updated <= 3.0);
+        speed
+            .map(|speed| format!("Prefill {speed:.1} t/s"))
+            .unwrap_or_else(|| "Prefill N/A t/s".into())
+    }
 }
 
 pub fn now() -> f64 {
@@ -526,6 +599,66 @@ pub fn check() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn token_rate_distinguishes_live_mean_last_and_stale_samples() -> Result<()> {
+        let mut snapshot = Snapshot::default();
+        let mut metrics = serde_json::json!({"engine":{"model":"fixture"},
+            "live":{"state":"generating","phase":"thinking","tok_s":61.2,"tok_s_mean":53.1,"generated":500},
+            "requests":[{"decode_tok_s":51.7}]});
+        snapshot.apply_live(&metrics)?;
+        assert_eq!(snapshot.phase, "thinking");
+        assert_eq!(
+            snapshot.rate_label(snapshot.updated),
+            "Live 61.2 · Mean 53.1 t/s"
+        );
+        assert_eq!(
+            snapshot.rate_label(snapshot.updated + 3.1),
+            "Live — · Mean — t/s"
+        );
+        metrics["live"]["state"] = "idle".into();
+        metrics["live"]["phase"] = Value::Null;
+        snapshot.apply_live(&metrics)?;
+        assert_eq!(snapshot.speed, None);
+        assert_eq!(snapshot.speed_mean, None);
+        assert_eq!(
+            snapshot.rate_label(snapshot.updated),
+            "Last request 51.7 t/s"
+        );
+        metrics["live"]["state"] = "reading".into();
+        snapshot.apply_live(&metrics)?;
+        assert_eq!(snapshot.rate_label(snapshot.updated), "Live — · Mean — t/s");
+        metrics["live"]["state"] = "generating".into();
+        metrics["live"]["tok_s"] = (-1).into();
+        assert!(snapshot.apply_live(&metrics).is_err());
+        Ok(())
+    }
+    #[test]
+    fn prefill_rate_uses_engine_mean_only_while_reading_and_fresh() -> Result<()> {
+        let mut snapshot = Snapshot::default();
+        let mut metrics = serde_json::json!({"engine":{"model":"fixture"},
+            "live":{"state":"reading","phase":"reading the prompt","prefill_tok_s_mean":1245.6}});
+        snapshot.apply_live(&metrics)?;
+        assert_eq!(
+            snapshot.prefill_label(snapshot.updated),
+            "Prefill 1245.6 t/s"
+        );
+        assert_eq!(
+            snapshot.prefill_label(snapshot.updated + 3.1),
+            "Prefill N/A t/s"
+        );
+        assert_eq!(snapshot.speed, None);
+        metrics["live"]["state"] = "generating".into();
+        snapshot.apply_live(&metrics)?;
+        assert_eq!(snapshot.prefill_speed, None);
+        assert_eq!(snapshot.prefill_label(snapshot.updated), "Prefill N/A t/s");
+        metrics["live"]["state"] = "reading".into();
+        metrics["live"]["prefill_tok_s_mean"] = Value::Null;
+        snapshot.apply_live(&metrics)?;
+        assert_eq!(snapshot.prefill_label(snapshot.updated), "Prefill N/A t/s");
+        metrics["live"]["prefill_tok_s_mean"] = (-1).into();
+        assert!(snapshot.apply_live(&metrics).is_err());
+        Ok(())
+    }
     #[test]
     fn new_data_folder_initializes_without_overwriting_existing_data() -> Result<()> {
         let directory =

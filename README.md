@@ -57,7 +57,13 @@ Moving the hub does not rewrite paths inside third-party Strata profiles. Those 
 
 ## Models
 
-Choose a discovered profile under **Models**, edit **Engine**, **Sampling** or **Advanced**, then save or start it. Profile filenames may differ between PCs. Empty numeric or sampling fields preserve unset Strata defaults. Strata metadata files without a model definition are skipped.
+Choose a discovered profile under **Models**, edit its settings, then save or start it. Profile filenames may differ between PCs. Empty numeric or sampling fields preserve unset Strata defaults. Strata metadata files without a model definition are skipped.
+
+**Advanced** adapts to the profile's engine family, with 39 Qwen options and 17 DeepSeek options. Select a parameter to read its description and edit its value. Existing raw arguments migrate into named controls when loaded. DeepSeek 0.1.50 adds `--experts`: 6 keeps full quality, 5 chooses Faster, and auto lets the engine choose for the hardware. Qwen's **Adapt async** supports Auto, On and Off while preserving saved boolean choices. See [ADVANCED.md](ADVANCED.md) for supported options and migration behavior.
+
+**Start standard** uses the profile's normal engine. **Start experimental** appears only when that profile has a nonblank `hub_experimental.exe`; both starts share the model's saved settings. The optional runtime object can override executable, working directory, libraries, server and environment without creating a second model entry.
+
+Qwen also has **Performance** controls and an explicit **Calibration** action. Calibration requires a stopped model and saved settings, runs upstream hardware measurements and saves tuning only after success. **Elastic KV cache** and **KV streaming (32K GPU, more RAM)** are mutually exclusive. DeepSeek hides these Qwen controls and currently supports one text request at a time.
 
 **Context** offers 4K, 8K, 16K, 32K, 64K, 96K, 128K, 192K and 256K presets (K = 1024 tokens). The adjacent numeric field remains editable; typing another token count selects **Custom**, while entering a preset's exact count selects its label. Choosing **Custom** focuses the numeric field without replacing its current value. Context edits follow the same Save/next-launch behavior as other settings. The Engine page groups memory, generation and server settings separately; native controls retain keyboard and accessibility behavior.
 
@@ -95,13 +101,15 @@ The report includes daily totals, model totals, recent requests, historical log-
 
 Memory readings use native Windows process APIs and the language-neutral `GPU Process Memory` performance counter, within the existing worker. No helper process, inference request or extra polling thread is started. GPU counters are opened only while a Strata process exists. Missing or unsupported readings display **N/A**, with the error in the footer; no device-total value is substituted. Dedicated GPU readings depend on the Windows WDDM driver/counters and can differ from physical adapter totals. See [Microsoft's per-process GPU memory explanation](https://devblogs.microsoft.com/directx/gpus-in-the-task-manager/) and [GPU counter limitations](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/gpu-process-memory-counters-report-wrong-value).
 
-Live metrics and memory refresh every 2 seconds while visible. Full history collection and SQLite updates occur every 15 seconds; hidden or minimized windows poll every 15 seconds. Memory is live only and is not stored in the usage database. No prompts or responses are stored in the usage database.
+Live metrics refresh every second while visible, with memory readings sampled every 2 seconds. Full history collection and SQLite updates occur every 15 seconds; hidden or minimized windows poll every 15 seconds. Memory is live only and is not stored in the usage database. No prompts or responses are stored in the usage database.
 
 Model pricing and EUR/USD conversion come from the configured pricing JSON and are displayed to two decimal places. Cost figures estimate the equivalent hosted API usage. Historical log imports from an existing data folder are preserved; undated segments are not assigned invented dates. Importing old external logs is not automated by this release.
 
 ## Updates
 
-**Check for updates** checks the official stable Strata release only when clicked. **Install update** requires a newer release and a stopped model. It verifies the official Git origin and a clean tracked working tree, backs up the engine and profiles, fetches the selected release tag and fast-forwards the checkout. It runs the official `setup.py --update --data-dir ... --yes` without starting inference.
+**Check for updates** checks the official stable source release and the signed standard (Qwen) engine feed only when clicked. Their versions are compared independently. **Install update** requires an available update and a stopped model. It verifies the official Git origin and a clean tracked working tree, backs up the engine and profiles, and fast-forwards the checkout when the source is newer. Python dependencies follow official setup's selection. Engine packages use the official hardware selector, signatures and file hashes, with a binary-only version/DLL check. The verified engine is also installed into the legacy `engine` folder used by existing profiles. See [UPDATES.md](UPDATES.md) for details.
+
+DeepSeek uses its own engine package and configured executable path. Its package updates are handled separately through the official Strata tools; the Hub update button currently manages the standard engine.
 
 The updater checks the installed version, protected profile hashes and model-weight metadata afterwards. Backups live under `update-backups` in the hub data folder and contain manual restore instructions. There are no automatic retries, forced source resets or automatic rollback. Python package versions are not included in the engine backup. Upstream changes to protected source profiles can require manual review. See `strata-update.log` for progress and errors.
 

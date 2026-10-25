@@ -152,6 +152,15 @@ impl Launch {
                 }
             }
         };
+        Self::from_handle(record, handle)
+    }
+    pub fn from_owned(record: &Value, handle: OwnedHandle) -> Result<Self> {
+        Self::from_handle(record, Some(handle))
+    }
+    fn from_handle(record: &Value, handle: Option<OwnedHandle>) -> Result<Self> {
+        let created = record["created"]
+            .as_u64()
+            .ok_or("Invalid owned creation time")?;
         let log = |key: &str, file: PathBuf| -> Result<LogTail> {
             // Older ownership records predate log offsets: start observing at the current end.
             let offset = match record.get(key) {

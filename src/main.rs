@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 mod config;
 mod data;
+mod engine_options;
 mod hub_ui;
 mod installer;
 mod jobs;
@@ -48,11 +49,11 @@ const UPDATE: u32 = WM_APP + 1;
 const TRAY: u32 = WM_APP + 2;
 const START: u32 = WM_APP + 3;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const BG: u32 = 0x0018120f;
-const PANEL: u32 = 0x002a1f17;
+const BG: u32 = 0x001b1511;
+const PANEL: u32 = 0x002a221c;
 const ACCENT: u32 = 0x00b6df76;
 const WHITE: u32 = 0x00f7f1ea;
-const MUTED: u32 = 0x00bfafa3;
+const MUTED: u32 = 0x00b9ada3;
 
 #[derive(Clone, Copy)]
 struct AgentSettings {
@@ -77,6 +78,8 @@ struct App {
     pending_agent_settings: Option<AgentSettings>,
     syncing_agent_settings: bool,
     models: jobs::Job,
+    calibration: jobs::Job,
+    calibration_run: Option<(PathBuf, f64)>,
     library: models_ui::Library,
     installed_version: String,
     auth_profile: Arc<Mutex<Option<PathBuf>>>,
@@ -98,6 +101,7 @@ fn log_error(message: &str) {
     }
 }
 fn message(hwnd: HWND, text: &str) {
+    log_error(&format!("Dialog: {text}"));
     unsafe {
         MessageBoxW(
             hwnd,
@@ -331,7 +335,7 @@ fn paint(hwnd: HWND, app: &mut App) {
             .clone();
         text(
             dc,
-            rect(28, 22, 450, 42),
+            rect(28, 22, (width - 760).max(100), 42),
             match app.tools_page {
                 3 => "Updates",
                 4 => "Agents",
@@ -350,7 +354,10 @@ fn paint(hwnd: HWND, app: &mut App) {
             .launch
             .as_ref()
             .is_some_and(|launch| !launch.failed() && launch.phase != launch::Phase::Ready);
-        let color = if failed {
+        let calibrating = app.calibration_run.is_some();
+        let color = if calibrating {
+            theme::WARNING
+        } else if failed {
             theme::ERROR
         } else if loaded {
             ACCENT
@@ -359,7 +366,9 @@ fn paint(hwnd: HWND, app: &mut App) {
         } else {
             MUTED
         };
-        let label = if failed {
+        let label = if calibrating {
+            "Calibrating"
+        } else if failed {
             "Error"
         } else if loaded {
             "Online"
@@ -377,20 +386,27 @@ fn paint(hwnd: HWND, app: &mut App) {
             width,
             label,
             color,
-            if loaded { snapshot.speed } else { None },
+            &snapshot.rate_label(data::now()),
+            &snapshot.prefill_label(data::now()),
             app.fonts[0],
         );
-        let launch_detail = app
-            .launch
-            .as_ref()
-            .map(|launch| launch.summary(loaded, snapshot.slots.max(1)))
-            .unwrap_or_else(|| {
-                if loaded {
-                    format!("Ready · {} slots", snapshot.slots.max(1))
-                } else {
-                    "No model running".into()
-                }
-            });
+        let launch_detail = if calibrating {
+            app.calibration.status().data["stage"]
+                .as_str()
+                .unwrap_or("Preparing calibration")
+                .to_owned()
+        } else {
+            app.launch
+                .as_ref()
+                .map(|launch| launch.summary(loaded, snapshot.slots.max(1)))
+                .unwrap_or_else(|| {
+                    if loaded {
+                        format!("Ready · {} slots", snapshot.slots.max(1))
+                    } else {
+                        "No model running".into()
+                    }
+                })
+        };
         let detail = if loaded && !failed {
             let phase = match snapshot.phase.as_str() {
                 "idle" => "Idle",
@@ -478,6 +494,8 @@ fn paint(hwnd: HWND, app: &mut App) {
                     .as_ref()
                     .map(|l| l.phase.step())
                     .unwrap_or(if loaded { 5 } else { 0 }),
+                &app.calibration.status(),
+                app.calibration_run.as_ref().map(|(_, started)| *started),
             );
         } else {
             let gap = 16;
@@ -650,7 +668,7 @@ fn paint(hwnd: HWND, app: &mut App) {
             )
         } else if snapshot.error.is_empty() || snapshot.error == "Strata offline" {
             format!(
-                "Local  ·  {}  ·  Live 2 s · Totals 15 s  ·  Hub RAM {:.1} MiB",
+                "Local  ·  {}  ·  Live 1 s · Totals 15 s  ·  Hub RAM {:.1} MiB",
                 data::local_date(snapshot.updated, true),
                 own_memory()
             )
@@ -673,12 +691,19 @@ fn paint(hwnd: HWND, app: &mut App) {
     }
 }
 fn start_strata(hwnd: HWND, app: &mut App) -> Result<()> {
+    start_strata_engine(hwnd, app, false)
+}
+fn start_strata_engine(hwnd: HWND, app: &mut App, experimental: bool) -> Result<()> {
+    log_error("Start model action received");
     if app.hub.profiles.is_empty() {
         return Err("Prepare a model profile before starting Strata.".into());
     }
-    if app.updates.status().blocks_model || app.models.status().blocks_model {
+    if app.updates.status().blocks_model
+        || app.models.status().blocks_model
+        || app.calibration_run.is_some()
+    {
         return Err(
-            "Wait for the current Strata update or model file operation before starting a model."
+            "Wait for calibration, the Strata update or model file operation before starting a model."
                 .into(),
         );
     }
@@ -707,7 +732,7 @@ fn start_strata(hwnd: HWND, app: &mut App) -> Result<()> {
     }
     app.hub.profiles[app.hub.selected].settings = hub_ui::read(hwnd)?;
     let agent_settings = agent_settings_target(&app.hub.profiles[app.hub.selected].settings)?;
-    let config = app.hub.prepare()?;
+    let config = app.hub.prepare(experimental)?;
     app.hub.save()?;
     hub_ui::saved(hwnd);
     app.pending_agent_settings = Some(agent_settings);
@@ -728,7 +753,32 @@ fn start_strata(hwnd: HWND, app: &mut App) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error.into()),
     };
-    let child = Command::new(data::python())
+    // An experimental profile can pair its engine with an isolated Python server.
+    let runtime: serde_json::Value = serde_json::from_slice(&std::fs::read(&config)?)?;
+    let server_dir = match runtime.get("server_dir") {
+        None => data::strata_home(),
+        Some(value) => {
+            let path = Path::new(
+                value
+                    .as_str()
+                    .ok_or("server_dir must be an absolute path")?,
+            );
+            if !path.is_absolute() || !path.join("serve/server.py").is_file() {
+                return Err("server_dir must contain serve/server.py at an absolute path".into());
+            }
+            path
+        }
+    };
+    let mut server = Command::new(data::python());
+    if let Some(value) = runtime.get("server_env") {
+        for (key, value) in value.as_object().ok_or("server_env must be an object")? {
+            server.env(
+                key,
+                value.as_str().ok_or("server_env values must be strings")?,
+            );
+        }
+    }
+    let child = server
         .args([
             "-u",
             "-m",
@@ -742,7 +792,7 @@ fn start_strata(hwnd: HWND, app: &mut App) -> Result<()> {
             "--port",
             &port.to_string(),
         ])
-        .current_dir(data::strata_home())
+        .current_dir(server_dir)
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(stdout)
@@ -751,8 +801,17 @@ fn start_strata(hwnd: HWND, app: &mut App) -> Result<()> {
     app.child = Some(child);
     let child = app.child.as_ref().expect("Child just assigned");
     let created = process_created(child.as_raw_handle())?;
+    let engine_label = format!(
+        "{} · {} engine",
+        app.hub.profiles[app.hub.selected].label,
+        if experimental {
+            "Experimental"
+        } else {
+            "Standard"
+        }
+    );
     let record = serde_json::json!({"pid":child.id(),"created":created,"config":config,"profile":app.hub.profiles[app.hub.selected].file,
-        "label":app.hub.profiles[app.hub.selected].label,"parallel":app.hub.profiles[app.hub.selected].settings.parallel,
+        "label":engine_label,"parallel":app.hub.profiles[app.hub.selected].settings.parallel,
         "stdout_start":stdout_start,"stderr_start":stderr_start,"engine_start":engine_start,"engine_log":engine_log,"port":port});
     std::fs::write(
         data::root().join("owned-strata.json"),
@@ -760,7 +819,7 @@ fn start_strata(hwnd: HWND, app: &mut App) -> Result<()> {
     )?;
     app.launch = Some(launch::Launch::from_record(&record)?);
     *app.auth_profile.lock().expect("Profile mutex poisoned") = Some(config);
-    app.hub.notice = format!("Starting {}", app.hub.profiles[app.hub.selected].label);
+    app.hub.notice = format!("Starting {engine_label}");
     app.refresh.send(())?;
     unsafe {
         InvalidateRect(hwnd, null(), 0);
@@ -779,8 +838,11 @@ fn process_created(handle: HANDLE) -> Result<u64> {
         Ok((created.dwHighDateTime as u64) << 32 | created.dwLowDateTime as u64)
     }
 }
-fn recorded_child() -> Result<Option<(u32, OwnedHandle)>> {
-    let bytes = match std::fs::read(data::root().join("owned-strata.json")) {
+fn recorded_child() -> Result<Option<(u32, OwnedHandle, serde_json::Value)>> {
+    recorded_child_at(&data::root().join("owned-strata.json"))
+}
+fn recorded_child_at(path: &Path) -> Result<Option<(u32, OwnedHandle, serde_json::Value)>> {
+    let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -791,7 +853,11 @@ fn recorded_child() -> Result<Option<(u32, OwnedHandle)>> {
         .as_u64()
         .ok_or("Invalid owned Strata creation time")?;
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        );
         if handle.is_null() {
             if GetLastError() == ERROR_INVALID_PARAMETER {
                 return Ok(None);
@@ -806,34 +872,68 @@ fn recorded_child() -> Result<Option<(u32, OwnedHandle)>> {
         if code != STILL_ACTIVE as u32 || process_created(handle)? != created {
             return Ok(None);
         }
-        Ok(Some((pid, owned)))
+        Ok(Some((pid, owned, record)))
+    }
+}
+fn restore_session(hub: &profiles::Hub) -> Result<(Option<PathBuf>, Option<launch::Launch>)> {
+    let selected = || {
+        hub.profiles
+            .get(hub.selected)
+            .map(|profile| profile.path.clone())
+    };
+    match recorded_child()? {
+        Some((_, handle, record)) => {
+            let profile = record
+                .get("config")
+                .map(|v| {
+                    v.as_str()
+                        .map(PathBuf::from)
+                        .ok_or("Invalid owned profile path")
+                })
+                .transpose()?
+                .or_else(selected);
+            Ok((profile, Some(launch::Launch::from_owned(&record, handle)?)))
+        }
+        // Retain the saved record for diagnostics, but never replay a dead launch.
+        None => Ok((selected(), None)),
     }
 }
 fn stop_strata(hwnd: HWND, app: &mut App) -> Result<()> {
     // Keep a process handle open to prevent PID reuse while stopping the owned tree.
     let recorded = recorded_child()?;
-    let pid = match app.child.as_mut() {
+    let target = match app.child.as_mut() {
         Some(child) => {
             if child.try_wait()?.is_none() {
-                Some(child.id())
+                Some((child.id(), child.as_raw_handle()))
             } else {
-                recorded.as_ref().map(|(pid, _)| *pid)
+                recorded
+                    .as_ref()
+                    .map(|(pid, handle, _)| (*pid, handle.as_raw_handle()))
             }
         }
-        _ => recorded.as_ref().map(|(pid, _)| *pid),
+        _ => recorded
+            .as_ref()
+            .map(|(pid, handle, _)| (*pid, handle.as_raw_handle())),
     };
-    if let Some(pid) = pid {
-        let status = Command::new("taskkill.exe")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err("Could not stop the Strata process".into());
-        }
+    if let Some((pid, handle)) = target {
+        // Serialize detaching the launch with publication of its final metrics.
+        let mut monitored = app.auth_profile.lock().expect("Profile mutex poisoned");
+        stop_owned_process(pid, handle)?;
         app.child = None;
         app.launch = None;
+        *monitored = None;
+        {
+            let mut snapshot = app.snapshot.lock().expect("Snapshot mutex poisoned");
+            snapshot.online = false;
+            snapshot.speed = None;
+            snapshot.speed_mean = None;
+            snapshot.prefill_speed = None;
+            snapshot.generated = None;
+            snapshot.phase.clear();
+            snapshot.error.clear();
+            snapshot.memory = Default::default();
+        }
+        drop(monitored);
         app.hub.notice = "Strata stopped.".into();
         std::fs::remove_file(data::root().join("owned-strata.json"))?;
         app.refresh.send(())?;
@@ -842,6 +942,41 @@ fn stop_strata(hwnd: HWND, app: &mut App) -> Result<()> {
             hwnd,
             "No server started by this app is running. Stop externally launched servers from their original launcher.",
         );
+    }
+    Ok(())
+}
+fn confirm_process_stopped(
+    handle: HANDLE,
+    output: &std::process::Output,
+    timeout: u32,
+) -> Result<()> {
+    // taskkill can return an error after its target exited. Judge Stop by the owned process handle.
+    match unsafe { WaitForSingleObject(handle, timeout) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => Err(format!(
+            "The Strata process is still running after Stop. taskkill {}. {} {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into()),
+        _ => Err(std::io::Error::last_os_error().into()),
+    }
+}
+fn stop_owned_process(pid: u32, handle: HANDLE) -> Result<()> {
+    let output = Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .output()?;
+    confirm_process_stopped(handle, &output, 5000)?;
+    if !output.status.success() {
+        log_error(&format!(
+            "Stop completed for PID {pid}; process exit confirmed. taskkill {}. {} {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     Ok(())
 }
@@ -857,32 +992,28 @@ fn worker(
         let mut stored_at = Instant::now();
         let mut full = true;
         let mut resources = resources::Monitor::default();
+        let mut memory = resources::Memory::default();
+        let mut memory_profile = None;
+        let mut next_memory = Instant::now();
         loop {
             let profile = auth_profile.lock().expect("Profile mutex poisoned").clone();
             full |= stored_at.elapsed() >= Duration::from_secs(15);
             if let Some(profile) = profile.as_deref() {
-                match data::fetch_metrics(profile, full) {
+                let fetched = data::fetch_metrics(profile, full);
+                // A completed sample belongs to the launch that requested it.
+                // Stop may have detached that launch while the HTTP read was pending.
+                let current = auth_profile.lock().expect("Profile mutex poisoned");
+                if current.as_deref() != Some(profile) {
+                    continue;
+                }
+                match fetched {
                     Ok(value) => {
                         if full {
                             data::store(&mut db, &value)?;
                             snapshot = data::load(&db)?;
                             stored_at = Instant::now();
                         }
-                        snapshot.online = true;
-                        snapshot.error.clear();
-                        snapshot.updated = data::now();
-                        snapshot.model = value["engine"]["model"]
-                            .as_str()
-                            .ok_or("Missing loaded model")?
-                            .into();
-                        snapshot.phase = value["live"]["phase"]
-                            .as_str()
-                            .unwrap_or(value["live"]["state"].as_str().unwrap_or(""))
-                            .into();
-                        snapshot.speed = value["live"]["tok_s"].as_f64();
-                        snapshot.generated = value["live"]["generated"].as_i64();
-                        snapshot.slots =
-                            u32::try_from(value["live"]["parallel"].as_u64().unwrap_or(1))?.max(1);
+                        snapshot.apply_live(&value)?;
                     }
                     Err(error) => {
                         let network = error.downcast_ref::<std::io::Error>().is_some_and(|e| {
@@ -895,17 +1026,14 @@ fn worker(
                                     | std::io::ErrorKind::WouldBlock
                                     | std::io::ErrorKind::UnexpectedEof
                                     | std::io::ErrorKind::NotConnected
-                            ) || (e.kind() == std::io::ErrorKind::NotFound
-                                && auth_profile
-                                    .lock()
-                                    .expect("Profile mutex poisoned")
-                                    .is_none())
+                            )
                         });
                         if !network {
                             return Err(error);
                         }
                         snapshot.online = false;
                         snapshot.speed = None;
+                        snapshot.speed_mean = None;
                         snapshot.generated = None;
                         snapshot.error = "Strata offline".into();
                         snapshot.updated = data::now();
@@ -918,18 +1046,29 @@ fn worker(
                 }
                 snapshot.online = false;
                 snapshot.speed = None;
+                snapshot.speed_mean = None;
                 snapshot.generated = None;
                 snapshot.error.clear();
                 snapshot.updated = data::now();
             }
-            snapshot.memory = resources.sample(profile.as_deref());
+            if profile != memory_profile || Instant::now() >= next_memory {
+                memory = resources.sample(profile.as_deref());
+                memory_profile = profile.clone();
+                next_memory = Instant::now() + Duration::from_secs(2);
+            }
+            snapshot.memory = memory.clone();
+            let current = auth_profile.lock().expect("Profile mutex poisoned");
+            if *current != profile {
+                continue;
+            }
             *state.lock().expect("Snapshot mutex poisoned") = snapshot.clone();
+            drop(current);
             unsafe {
                 PostMessageW(hwnd as HWND, UPDATE, 0, 0);
             }
             let visible =
                 unsafe { IsWindowVisible(hwnd as HWND) != 0 && IsIconic(hwnd as HWND) == 0 };
-            full = match receiver.recv_timeout(Duration::from_secs(if visible { 2 } else { 15 })) {
+            full = match receiver.recv_timeout(Duration::from_secs(if visible { 1 } else { 15 })) {
                 Ok(()) => true,
                 Err(mpsc::RecvTimeoutError::Timeout) => false,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -942,6 +1081,7 @@ fn worker(
         let mut snapshot = state.lock().expect("Snapshot mutex poisoned");
         snapshot.online = false;
         snapshot.speed = None;
+        snapshot.speed_mean = None;
         snapshot.memory = Default::default();
         snapshot.error = format!("Metrics error: {error}");
         unsafe {
@@ -988,30 +1128,71 @@ fn monitor_launch(hwnd: HWND, app: &mut App) {
             .profiles
             .get(app.hub.selected)
             .map(|profile| profile.settings.vision),
+        app.calibration_run.is_some(),
     );
     models_ui::sync_controls(
         hwnd,
         &app.library,
         &app.models.status(),
         snapshot.online || app.launch.as_ref().is_some_and(|l| l.running),
-        app.updates.status().busy,
+        app.updates.status().busy || app.calibration_run.is_some(),
     );
     // Controls reflect process ownership; an external server still blocks another launch.
     let owned = app.launch.as_ref().is_some_and(|l| l.running);
+    let can_start = !app.hub.profiles.is_empty()
+        && !owned
+        && !snapshot.online
+        && !app.updates.status().blocks_model
+        && !app.models.status().blocks_model
+        && app.calibration_run.is_none();
     unsafe {
         windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
             GetDlgItem(hwnd, hub_ui::RUN as i32),
-            (!app.hub.profiles.is_empty()
-                && !owned
-                && !snapshot.online
-                && !app.updates.status().blocks_model
-                && !app.models.status().blocks_model) as i32,
+            can_start as i32,
+        );
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+            GetDlgItem(hwnd, hub_ui::RUN_EXPERIMENTAL as i32),
+            (can_start
+                && app
+                    .hub
+                    .profiles
+                    .get(app.hub.selected)
+                    .is_some_and(|p| p.has_experimental)) as i32,
         );
         windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
             GetDlgItem(hwnd, hub_ui::STOP as i32),
             owned as i32,
         );
         if changed && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
+            InvalidateRect(hwnd, null(), 0);
+        }
+    }
+    let calibrating = app.calibration_run.is_some();
+    let log_available = app.calibration.log.is_file()
+        || app
+            .hub
+            .profiles
+            .get(app.hub.selected)
+            .and_then(|p| p.calibration.as_ref())
+            .and_then(|v| v["log"].as_str())
+            .is_some_and(|path| Path::new(path).is_file());
+    hub_ui::calibration_controls(
+        hwnd,
+        &app.hub,
+        calibrating,
+        !app.hub.profiles.is_empty()
+            && !owned
+            && !snapshot.online
+            && !calibrating
+            && !app.updates.status().busy
+            && !app.models.status().busy
+            && !app.agents.status().busy
+            && app.pending_agent_settings.is_none()
+            && !hub_ui::modified(hwnd),
+        log_available,
+    );
+    if calibrating {
+        unsafe {
             InvalidateRect(hwnd, null(), 0);
         }
     }
@@ -1109,6 +1290,9 @@ fn tools_command(hwnd: HWND, app: &mut App, id: usize) -> Result<()> {
     if id == tools_ui::AGENT_LOG {
         return open_log(&app.agents.log);
     }
+    if app.calibration_run.is_some() {
+        return Err("Wait for model calibration before starting another operation.".into());
+    }
     if id == tools_ui::RELEASE {
         let status = app.updates.status();
         let url = status.data["url"]
@@ -1164,9 +1348,14 @@ fn tools_command(hwnd: HWND, app: &mut App, id: usize) -> Result<()> {
             }
             arguments.extend([
                 "--tag".into(),
-                state.data["latest"]
+                state.data["source_latest"]
                     .as_str()
                     .ok_or("Missing release tag")?
+                    .into(),
+                "--engine-version".into(),
+                state.data["latest"]
+                    .as_str()
+                    .ok_or("Missing engine version")?
                     .into(),
             ]);
         }
@@ -1179,7 +1368,7 @@ fn tools_command(hwnd: HWND, app: &mut App, id: usize) -> Result<()> {
             if install {
                 "Preparing Strata update"
             } else {
-                "Checking official stable releases"
+                "Checking stable source and signed engine updates"
             },
         )?;
     } else {
@@ -1284,7 +1473,7 @@ fn poll_agent_settings(hwnd: HWND, app: &mut App) {
             app.hub.notice = status.message;
         }
     }
-    if status.busy || app.updates.status().busy {
+    if status.busy || app.updates.status().busy || app.calibration_run.is_some() {
         return;
     }
     let Some(target) = app.pending_agent_settings.take() else {
@@ -1321,9 +1510,159 @@ fn poll_agent_settings(hwnd: HWND, app: &mut App) {
         }
     }
 }
+fn require_calibration_idle(hwnd: HWND, app: &App) -> Result<()> {
+    if app.calibration_run.is_some()
+        || app.updates.status().busy
+        || app.models.status().busy
+        || app.agents.status().busy
+        || app.pending_agent_settings.is_some()
+    {
+        return Err("Wait for the current hub operation before changing calibration.".into());
+    }
+    if hub_ui::modified(hwnd) {
+        return Err("Save model settings before changing calibration.".into());
+    }
+    if recorded_child()?.is_some()
+        || app.snapshot.lock().expect("Snapshot mutex poisoned").online
+        || app.launch.as_ref().is_some_and(|launch| launch.running)
+    {
+        return Err("Stop Strata before changing the selected model's calibration.".into());
+    }
+    Ok(())
+}
+fn reset_calibration(hwnd: HWND, app: &mut App) -> Result<()> {
+    require_calibration_idle(hwnd, app)?;
+    let profile = &app.hub.profiles[app.hub.selected];
+    let log = PathBuf::from(
+        profile
+            .calibration
+            .as_ref()
+            .ok_or("This profile has no calibration to reset.")?["log"]
+            .as_str()
+            .ok_or("Missing calibration log path")?,
+    );
+    let directory = data::root().join("calibration").join(format!(
+        "reset-{}-{}",
+        (data::now() * 1000.0) as u64,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(
+        directory
+            .parent()
+            .expect("Calibration directory has a parent"),
+    )?;
+    std::fs::create_dir(&directory)?;
+    app.hub.reset_calibration(&directory)?;
+    app.calibration = jobs::Job::at(log, &app.hub.notice);
+    app.calibration.tag(
+        "profile",
+        serde_json::json!(app.hub.profiles[app.hub.selected].file),
+    );
+    hub_ui::fill(hwnd, &app.hub);
+    hub_ui::visible(hwnd, app.show_hub);
+    monitor_launch(hwnd, app);
+    Ok(())
+}
+fn start_calibration(hwnd: HWND, app: &mut App) -> Result<()> {
+    if app.hub.profiles[app.hub.selected].settings.engine == engine_options::Engine::DeepSeek {
+        return Err("This hardware calibration is available for the Qwen engine only".into());
+    }
+    require_calibration_idle(hwnd, app)?;
+    let request = app.hub.calibration_request()?;
+    let parent = data::root().join("calibration");
+    std::fs::create_dir_all(&parent)?;
+    let directory = parent.join(format!(
+        "{}-{}",
+        (data::now() * 1000.0) as u64,
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory)?;
+    let request_path = directory.join("request.json");
+    std::fs::write(&request_path, serde_json::to_vec_pretty(&request)?)?;
+    let helper = directory.join("idle_check.py");
+    std::fs::write(&helper, include_str!("../scripts/update_strata.py"))?;
+    app.calibration = jobs::Job::at(
+        directory.join("operation.log"),
+        "Preparing model calibration",
+    );
+    app.calibration.tag("profile", request["profile"].clone());
+    app.calibration.start(
+        hwnd,
+        include_str!("../scripts/calibrate_model.py"),
+        vec![
+            "--root".into(),
+            data::strata_home().to_string_lossy().into_owned(),
+            "--report".into(),
+            data::root().to_string_lossy().into_owned(),
+            "--profiles".into(),
+            data::profiles_dir().to_string_lossy().into_owned(),
+            "--idle-helper".into(),
+            helper.to_string_lossy().into_owned(),
+            "--request".into(),
+            request_path.to_string_lossy().into_owned(),
+        ],
+        true,
+        true,
+        "Preparing model calibration",
+    )?;
+    app.calibration_run = Some((directory, data::now()));
+    hub_ui::select_section(hwnd, 3);
+    monitor_launch(hwnd, app);
+    Ok(())
+}
+
+fn poll_calibration(hwnd: HWND, app: &mut App) {
+    let status = app.calibration.status();
+    if status.busy || app.calibration_run.is_none() {
+        return;
+    }
+    let (directory, _) = app.calibration_run.take().expect("Calibration run checked");
+    let apply = || -> Result<serde_json::Value> {
+        if status.error {
+            return Err(status.message.clone().into());
+        }
+        let result = directory.join("result.json");
+        if std::fs::metadata(&result)?.len() > 1024 * 1024 {
+            return Err("Calibration result exceeds 1 MiB".into());
+        }
+        Ok(serde_json::from_slice(&std::fs::read(result)?)?)
+    };
+    match apply().and_then(|result| app.hub.apply_calibration(&result, &directory)) {
+        Ok(()) => {
+            app.calibration.finish(app.hub.notice.clone());
+            hub_ui::fill(hwnd, &app.hub);
+            hub_ui::visible(hwnd, app.show_hub);
+        }
+        Err(error) => {
+            let message = format!("Calibration was not applied: {error}");
+            app.calibration.fail(message.clone());
+            app.hub.notice = message.clone();
+            log_error(&message);
+        }
+    }
+    unsafe {
+        InvalidateRect(hwnd, null(), 0);
+    }
+}
+
 fn hub_command(hwnd: HWND, app: &mut App, id: usize, notification: u32) -> Result<()> {
     if app.hub.profiles.is_empty() {
         return Err("No prepared model profiles. Use Model library and Strata setup first.".into());
+    }
+    if app.calibration_run.is_some()
+        && ![
+            hub_ui::ENGINE,
+            hub_ui::SAMPLING,
+            hub_ui::ADVANCED,
+            hub_ui::CALIBRATION,
+            hub_ui::PERFORMANCE,
+            hub_ui::CALIBRATION_LOG,
+            hub_ui::LOG,
+            hub_ui::START_LOG,
+        ]
+        .contains(&id)
+    {
+        return Err("Wait for calibration before changing model settings.".into());
     }
     if app.models.status().blocks_model {
         return Err("Wait for the model file operation before changing model settings.".into());
@@ -1346,6 +1685,9 @@ fn hub_command(hwnd: HWND, app: &mut App, id: usize, notification: u32) -> Resul
             hub_ui::fill(hwnd, &app.hub);
         }
         hub_ui::RUN => start_strata(hwnd, app)?,
+        hub_ui::RUN_EXPERIMENTAL => {
+            start_strata_engine(hwnd, app, true)?;
+        }
         hub_ui::STOP => stop_strata(hwnd, app)?,
         hub_ui::SAVE => {
             app.hub.profiles[app.hub.selected].settings = hub_ui::read(hwnd)?;
@@ -1357,6 +1699,25 @@ fn hub_command(hwnd: HWND, app: &mut App, id: usize, notification: u32) -> Resul
             poll_agent_settings(hwnd, app);
         }
         hub_ui::ENGINE..=hub_ui::ADVANCED => hub_ui::select_section(hwnd, id - hub_ui::ENGINE),
+        hub_ui::CALIBRATION => hub_ui::select_section(hwnd, 3),
+        hub_ui::PERFORMANCE => hub_ui::select_section(hwnd, 4),
+        hub_ui::CALIBRATE => start_calibration(hwnd, app)?,
+        hub_ui::RESET_CALIBRATION => reset_calibration(hwnd, app)?,
+        hub_ui::CALIBRATION_LOG => {
+            let saved_log = app.hub.profiles[app.hub.selected]
+                .calibration
+                .as_ref()
+                .and_then(|v| v["log"].as_str())
+                .map(PathBuf::from);
+            let path = if app.calibration.status().data["profile"].as_str()
+                == Some(app.hub.profiles[app.hub.selected].file.as_str())
+            {
+                &app.calibration.log
+            } else {
+                saved_log.as_ref().unwrap_or(&app.calibration.log)
+            };
+            open_log(path)?;
+        }
         hub_ui::RESET => {
             app.hub.reset()?;
             hub_ui::fill(hwnd, &app.hub);
@@ -1501,13 +1862,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_TIMER if w == 1 => {
+                poll_calibration(hwnd, &mut *pointer);
                 poll_agent_settings(hwnd, &mut *pointer);
                 monitor_launch(hwnd, &mut *pointer);
+                if IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
+                    let mut header = RECT::default();
+                    GetClientRect(hwnd, &mut header);
+                    header.left = theme::SIDE;
+                    header.bottom = 96;
+                    InvalidateRect(hwnd, &header, 0);
+                }
                 0
             }
             UPDATE => {
                 let plan_result = {
                     let app = &mut *pointer;
+                    poll_calibration(hwnd, app);
                     poll_agent_settings(hwnd, app);
                     if app.snapshot.lock().expect("Snapshot mutex poisoned").online
                         && app.hub.notice.starts_with("Starting ")
@@ -1613,7 +1983,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
                 set_page(hwnd, app, w != 2);
-                if w == 1 {
+                if w == 1 || w == 3 {
                     if app.hub.profiles.is_empty() {
                         message(hwnd, "No prepared model profiles are available.");
                         return 0;
@@ -1627,7 +1997,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             .position(|p| p.file == "strata-swift-iq3_s-abliterated-no-images.json")
                             .ok_or("Huihui profile is missing")?;
                         hub_ui::fill(hwnd, &app.hub);
-                        start_strata(hwnd, app)
+                        start_strata_engine(hwnd, app, w == 3)
                     };
                     if let Err(error) = launch() {
                         message(hwnd, &error.to_string())
@@ -1673,6 +2043,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         || app.agents.status().mutating
                         || app.pending_agent_settings.is_some()
                         || app.models.status().busy
+                        || app.calibration_run.is_some()
                     {
                         message(
                             hwnd,
@@ -1691,6 +2062,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             || app.agents.status().busy
                             || app.pending_agent_settings.is_some()
                             || app.models.status().busy
+                            || app.calibration_run.is_some()
                     };
                     let change = || -> Result<()> {
                         if recorded_child()?.is_some() || busy {
@@ -1749,6 +2121,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             && hub_ui::modified(hwnd)
                         {
                             Err("Save model settings before changing or preparing models.".into())
+                        } else if app.calibration_run.is_some() {
+                            Err("Wait for model calibration to finish".into())
                         } else if app.updates.status().busy {
                             Err("Wait for the Strata update operation to finish".into())
                         } else {
@@ -1847,7 +2221,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             message(hwnd, &error.to_string());
                         }
                     }
-                    300..=313 => {
+                    300..=319 => {
                         if let Err(error) = hub_command(hwnd, app, id, (w >> 16) as u32) {
                             message(hwnd, &error.to_string());
                         }
@@ -1969,11 +2343,27 @@ fn run() -> Result<()> {
         if args.iter().any(|s| s == "--check") {
             data::check()?;
             let mut hub = profiles::Hub::load()?;
+            let (_, restored) = restore_session(&hub)?;
+            std::fs::write(
+                data::root().join("hub-startup-check.json"),
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"restored_launch":restored.is_some(),"owned_process_running":restored.as_ref().is_some_and(|l| l.running)}),
+                )?,
+            )?;
             let mut checked = Vec::new();
             for selected in 0..hub.profiles.len() {
                 hub.selected = selected;
                 let config = hub.configuration()?;
                 checked.push(serde_json::json!({"profile":hub.profiles[selected].file,"model":config["model_name"],"vision":hub.profiles[selected].settings.vision,"engine_arguments":config["args"].as_array().ok_or("Invalid arguments")?.len()}));
+                if hub.profiles[selected].has_experimental {
+                    let experimental = hub.engine_configuration(true)?;
+                    if config["args"] != experimental["args"]
+                        || config["sampling"] != experimental["sampling"]
+                    {
+                        return Err("Engine selection must preserve model settings".into());
+                    }
+                    checked.push(serde_json::json!({"profile":hub.profiles[selected].file,"engine":"experimental","exe":experimental["exe"],"settings_match":true}));
+                }
             }
             std::fs::write(
                 data::root().join("hub-check.json"),
@@ -1984,6 +2374,10 @@ fn run() -> Result<()> {
         let report_only = args.iter().any(|s| s == "--report-only");
         let background = args.iter().any(|s| s == "--background");
         let auto_huihui = args.iter().any(|s| s == "--start-huihui");
+        let auto_experimental = args.iter().any(|s| s == "--start-experimental");
+        log_error(&format!(
+            "Hub open: auto_start={auto_huihui}, report_only={report_only}, background={background}"
+        ));
         let name = wide("Local\\StrataNativeDashboard");
         let mutex = CreateMutexW(null(), 0, name.as_ptr());
         if mutex.is_null() {
@@ -1996,7 +2390,9 @@ fn run() -> Result<()> {
                     PostMessageW(
                         existing,
                         START,
-                        if auto_huihui {
+                        if auto_experimental {
+                            3
+                        } else if auto_huihui {
                             1
                         } else if report_only {
                             2
@@ -2053,28 +2449,7 @@ fn run() -> Result<()> {
             ),
         ];
         let hub = profiles::Hub::load()?;
-        let initial_profile = if recorded_child()?.is_some() {
-            let record: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(data::root().join("owned-strata.json"))?)?;
-            // The first dashboard version only launched Huihui and stored no config path.
-            record
-                .get("config")
-                .map(|v| {
-                    v.as_str()
-                        .map(PathBuf::from)
-                        .ok_or("Invalid owned profile path")
-                })
-                .transpose()?
-                .or_else(|| {
-                    hub.profiles
-                        .get(hub.selected)
-                        .map(|profile| profile.path.clone())
-                })
-        } else {
-            hub.profiles
-                .get(hub.selected)
-                .map(|profile| profile.path.clone())
-        };
+        let (initial_profile, initial_launch) = restore_session(&hub)?;
         let auth_profile = Arc::new(Mutex::new(initial_profile));
         let worker_profile = auth_profile.clone();
         let app = Box::new(App {
@@ -2103,6 +2478,11 @@ fn run() -> Result<()> {
                 "strata-models.log",
                 "Analyze a Hugging Face repository or scan local model files.",
             ),
+            calibration: jobs::Job::new(
+                "strata-calibration.log",
+                "Ready to calibrate the selected model.",
+            ),
+            calibration_run: None,
             library: models_ui::Library::default(),
             installed_version: serde_json::from_slice::<serde_json::Value>(&std::fs::read(
                 data::strata_home().join("engine/BUILD.json"),
@@ -2111,13 +2491,7 @@ fn run() -> Result<()> {
                 .ok_or("Missing installed engine version")?
                 .into(),
             auth_profile,
-            launch: match std::fs::read(data::root().join("owned-strata.json")) {
-                Ok(bytes) => Some(launch::Launch::from_record(&serde_json::from_slice(
-                    &bytes,
-                )?)?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            },
+            launch: initial_launch,
         });
         let pointer = Box::into_raw(app);
         let instance = GetModuleHandleW(null());
@@ -2162,8 +2536,8 @@ fn run() -> Result<()> {
         if !background {
             UpdateWindow(hwnd);
         }
-        if auto_huihui {
-            PostMessageW(hwnd, START, 1, 0);
+        if auto_huihui || auto_experimental {
+            PostMessageW(hwnd, START, if auto_experimental { 3 } else { 1 }, 0);
         }
         let mut msg: MSG = std::mem::zeroed();
         loop {
@@ -2197,5 +2571,136 @@ fn main() {
             );
         }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::process::ExitStatusExt;
+
+    #[test]
+    fn stopping_confirms_process_exit_even_when_taskkill_reports_an_error() -> Result<()> {
+        let mut exited = Command::new("cmd.exe")
+            .args(["/D", "/C", "exit", "/B", "1"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()?;
+        exited.wait()?;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: b"The process was not found.".to_vec(),
+        };
+        confirm_process_stopped(exited.as_raw_handle(), &output, 0)?;
+
+        let mut running = Command::new("ping.exe")
+            .args(["-t", "127.0.0.1"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .spawn()?;
+        let failed = confirm_process_stopped(running.as_raw_handle(), &output, 0);
+        running.kill()?;
+        running.wait()?;
+        let error = failed
+            .expect_err("A running process must not be reported as stopped")
+            .to_string();
+        assert!(error.contains("still running"));
+        assert!(error.contains("The process was not found."));
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_owned_process_uses_the_native_stop_path() -> Result<()> {
+        let mut child = Command::new("ping.exe")
+            .args(["-t", "127.0.0.1"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .spawn()?;
+        let result = stop_owned_process(child.id(), child.as_raw_handle());
+        if child.try_wait()?.is_none() {
+            child.kill()?;
+        }
+        child.wait()?;
+        result?;
+        Ok(())
+    }
+
+    #[test]
+    fn hub_bootstrap_rejects_dead_and_reused_owned_processes() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("strata-owned-startup-{}.json", std::process::id()));
+        let mut child = Command::new("ping.exe")
+            .args(["-t", "127.0.0.1"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .spawn()?;
+        let created = process_created(child.as_raw_handle())?;
+        let mut record = serde_json::json!({"pid":child.id(),"created":created});
+        std::fs::write(&path, serde_json::to_vec(&record)?)?;
+        let live = recorded_child_at(&path);
+        record["created"] = (created + 1).into();
+        std::fs::write(&path, serde_json::to_vec(&record)?)?;
+        let reused = recorded_child_at(&path);
+        child.kill()?;
+        child.wait()?;
+        assert!(live?.is_some());
+        assert!(reused?.is_none());
+        record["created"] = created.into();
+        let bytes = serde_json::to_vec(&record)?;
+        std::fs::write(&path, &bytes)?;
+        assert!(recorded_child_at(&path)?.is_none());
+        assert_eq!(std::fs::read(&path)?, bytes);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_during_a_metrics_read_discards_the_incomplete_response() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("strata-stop-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&directory)?;
+        let paths = config::Paths {
+            strata_dir: directory.clone(),
+            python: directory.join("unused.exe"),
+            models_dir: directory.clone(),
+            profiles_dir: directory.clone(),
+            data_dir: directory.clone(),
+            pricing_file: directory.join("qwen_pricing.json"),
+        };
+        data::initialize(&paths)?;
+        config::set(directory.join("settings.json"), paths)?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let profile = directory.join("profile.json");
+        std::fs::write(
+            &profile,
+            serde_json::to_vec(&serde_json::json!({"port":listener.local_addr()?.port()}))?,
+        )?;
+        let state = Arc::new(Mutex::new(Snapshot::default()));
+        let monitored = Arc::new(Mutex::new(Some(profile)));
+        let (refresh, receiver) = mpsc::channel();
+        let worker_state = state.clone();
+        let worker_profile = monitored.clone();
+        let worker = thread::spawn(move || worker(worker_state, receiver, 0, worker_profile));
+        let (accepted, connection) = mpsc::channel();
+        let server =
+            thread::spawn(move || accepted.send(listener.accept().map(|(stream, _)| stream)));
+        let mut stream = connection.recv_timeout(Duration::from_secs(5))??;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        // Wait for the request so the interrupted read is deterministic.
+        let mut request = [0u8; 1024];
+        assert!(std::io::Read::read(&mut stream, &mut request)? > 0);
+        *monitored.lock().expect("Profile mutex poisoned") = None;
+        drop(stream); // Stop closes HTTP before a complete response can arrive.
+        drop(refresh);
+        server.join().expect("Test server panicked")?;
+        worker.join().expect("Metrics worker panicked");
+        let snapshot = state.lock().expect("Snapshot mutex poisoned");
+        assert!(!snapshot.online);
+        assert!(snapshot.error.is_empty(), "{}", snapshot.error);
+        assert!(snapshot.memory.error.is_empty());
+        assert!(snapshot.updated > 0.0);
+        assert!(!directory.join("native.log").exists());
+        std::fs::remove_dir_all(&directory)?;
+        Ok(())
     }
 }

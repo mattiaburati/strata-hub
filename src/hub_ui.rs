@@ -1,7 +1,8 @@
 use crate::{
     ACCENT, MUTED, PANEL, WHITE,
     data::Result,
-    profiles::{FIELDS, Hub, Settings},
+    engine_options::{Engine, OPTIONS},
+    profiles::{FIELDS, Hub, PERFORMANCE_FIELD_START, Settings},
     rect, text, theme, wide,
 };
 use std::ptr::null;
@@ -11,7 +12,7 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::{BST_CHECKED, BST_UNCHECKED, EM_SETLIMITTEXT},
-        Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled},
+        Input::KeyboardAndMouse::EnableWindow,
         WindowsAndMessaging::*,
     },
 };
@@ -27,6 +28,12 @@ pub const ENGINE: usize = 310;
 pub const SAMPLING: usize = 311;
 pub const ADVANCED: usize = 312;
 pub const START_LOG: usize = 313;
+pub const CALIBRATION: usize = 314;
+pub const CALIBRATE: usize = 315;
+pub const CALIBRATION_LOG: usize = 316;
+pub const RESET_CALIBRATION: usize = 317;
+pub const PERFORMANCE: usize = 318;
+pub const RUN_EXPERIMENTAL: usize = 319;
 const ASYNC: usize = 350;
 const PIN: usize = 351;
 const RESIDENT: usize = 352;
@@ -34,6 +41,8 @@ const VISION: usize = 353;
 const PARALLEL: usize = 354;
 const PORT: usize = 355;
 const CONTEXT_PRESET: usize = 356;
+const KV_GROW: usize = 357;
+const KV_STREAM: usize = 358;
 const CONTEXT_PRESETS: &[(&str, &str)] = &[
     ("4K", "4096"),
     ("8K", "8192"),
@@ -47,7 +56,9 @@ const CONTEXT_PRESETS: &[(&str, &str)] = &[
     ("Custom", ""),
 ];
 const EXTRA: usize = 360;
+const OPTION: usize = 361;
 const FIRST_FIELD: usize = 400;
+const FIRST_OPTION: usize = 500;
 fn control(hwnd: HWND, id: usize) -> HWND {
     unsafe { GetDlgItem(hwnd, id as i32) }
 }
@@ -156,14 +167,70 @@ pub fn create(hwnd: HWND, hub: &Hub, fonts: &[HFONT; 4]) -> Result<()> {
                 }
             }
         }
+        add(
+            hwnd,
+            OPTION,
+            "COMBOBOX",
+            "",
+            CBS_DROPDOWNLIST as u32
+                | CBS_OWNERDRAWFIXED as u32
+                | CBS_HASSTRINGS as u32
+                | WS_VSCROLL,
+            fonts[0],
+        )?;
+        for (index, option) in OPTIONS.iter().enumerate() {
+            let choices = option.choices();
+            let item = add(
+                hwnd,
+                FIRST_OPTION + index,
+                if choices.is_empty() {
+                    "EDIT"
+                } else {
+                    "COMBOBOX"
+                },
+                "",
+                if choices.is_empty() {
+                    ES_AUTOHSCROLL as u32
+                } else {
+                    CBS_DROPDOWN as u32
+                        | CBS_OWNERDRAWFIXED as u32
+                        | CBS_HASSTRINGS as u32
+                        | WS_VSCROLL
+                },
+                fonts[0],
+            )?;
+            if choices.is_empty() {
+                SendMessageW(item, EM_SETLIMITTEXT, 4096, 0);
+            } else {
+                SendMessageW(item, CB_ADDSTRING, 0, wide("").as_ptr() as LPARAM);
+                for choice in choices {
+                    SendMessageW(item, CB_ADDSTRING, 0, wide(choice).as_ptr() as LPARAM);
+                }
+            }
+        }
         for (id, label) in [
-            (ASYNC, "Adapt async"),
             (PIN, "Pin by need"),
             (RESIDENT, "Resident experts"),
-            (VISION, "Vision support"),
+            (KV_GROW, "Elastic KV cache"),
+            (KV_STREAM, "KV streaming (32K GPU, more RAM)"),
+            (VISION, "Enable Vision"),
         ] {
             let checkbox = add(hwnd, id, "BUTTON", label, BS_AUTOCHECKBOX as u32, fonts[0])?;
             theme::checkbox(checkbox)?;
+        }
+        let adaptive = add(
+            hwnd,
+            ASYNC,
+            "COMBOBOX",
+            "",
+            CBS_DROPDOWNLIST as u32
+                | CBS_OWNERDRAWFIXED as u32
+                | CBS_HASSTRINGS as u32
+                | WS_VSCROLL,
+            fonts[0],
+        )?;
+        for label in ["Auto (engine default)", "On", "Off"] {
+            SendMessageW(adaptive, CB_ADDSTRING, 0, wide(label).as_ptr() as LPARAM);
         }
         let context = add(
             hwnd,
@@ -224,7 +291,8 @@ pub fn create(hwnd: HWND, hub: &Hub, fonts: &[HFONT; 4]) -> Result<()> {
         SendMessageW(port, EM_SETLIMITTEXT, 5, 0);
         SendMessageW(extra, EM_SETLIMITTEXT, 32768, 0);
         for (id, label) in [
-            (RUN, "Start model"),
+            (RUN, "Start standard"),
+            (RUN_EXPERIMENTAL, "Start experimental"),
             (STOP, "Stop"),
             (SAVE, "Save changes"),
             (RESET, "Reset"),
@@ -234,6 +302,11 @@ pub fn create(hwnd: HWND, hub: &Hub, fonts: &[HFONT; 4]) -> Result<()> {
             (ENGINE, "Engine"),
             (SAMPLING, "Sampling"),
             (ADVANCED, "Advanced"),
+            (CALIBRATION, "Calibration"),
+            (PERFORMANCE, "Performance"),
+            (CALIBRATE, "Calibrate model"),
+            (CALIBRATION_LOG, "Open calibration log"),
+            (RESET_CALIBRATION, "Reset calibration"),
         ] {
             add(hwnd, id, "BUTTON", label, BS_OWNERDRAW as u32, fonts[0])?;
         }
@@ -249,7 +322,7 @@ pub fn select_section(hwnd: HWND, section: usize) {
         SetWindowLongPtrW(control(hwnd, ENGINE), GWLP_USERDATA, section as isize);
         resize(hwnd);
         visible(hwnd, true);
-        for id in ENGINE..=ADVANCED {
+        for id in [ENGINE, SAMPLING, ADVANCED, CALIBRATION, PERFORMANCE] {
             InvalidateRect(control(hwnd, id), null(), 0);
         }
         InvalidateRect(hwnd, null(), 0);
@@ -274,14 +347,24 @@ pub fn saved(hwnd: HWND) {
 }
 pub fn edit_notification(hwnd: HWND, id: usize, notification: u32) -> bool {
     unsafe {
+        if id == OPTION {
+            if notification == CBN_SELCHANGE {
+                visible(hwnd, true);
+                InvalidateRect(hwnd, null(), 0);
+            }
+            return true;
+        }
         let is_field = (FIRST_FIELD..FIRST_FIELD + FIELDS.len()).contains(&id);
-        let checkbox = [ASYNC, PIN, RESIDENT, VISION].contains(&id);
+        let is_option = (FIRST_OPTION..FIRST_OPTION + OPTIONS.len()).contains(&id);
+        let checkbox = [PIN, RESIDENT, VISION, KV_GROW, KV_STREAM].contains(&id);
         if !is_field
+            && !is_option
             && !checkbox
             && id != EXTRA
             && id != PARALLEL
             && id != PORT
             && id != CONTEXT_PRESET
+            && id != ASYNC
         {
             return false;
         }
@@ -313,7 +396,17 @@ pub fn edit_notification(hwnd: HWND, id: usize, notification: u32) -> bool {
         if id == FIRST_FIELD && notification == EN_CHANGE {
             sync_context(hwnd);
         }
-        let combo = id == PARALLEL || (is_field && !FIELDS[id - FIRST_FIELD].choices.is_empty());
+        if matches!(id, KV_GROW | KV_STREAM)
+            && notification == BN_CLICKED
+            && SendMessageW(control(hwnd, id), BM_GETCHECK, 0, 0) == BST_CHECKED as isize
+        {
+            let other = if id == KV_STREAM { KV_GROW } else { KV_STREAM };
+            SendMessageW(control(hwnd, other), BM_SETCHECK, BST_UNCHECKED as usize, 0);
+        }
+        let combo = id == PARALLEL
+            || id == ASYNC
+            || (is_field && !FIELDS[id - FIRST_FIELD].choices.is_empty())
+            || (is_option && !OPTIONS[id - FIRST_OPTION].choices().is_empty());
         if (checkbox && notification == BN_CLICKED)
             || (combo && [CBN_EDITCHANGE, CBN_SELCHANGE].contains(&notification))
             || (!combo && !checkbox && notification == EN_CHANGE)
@@ -338,6 +431,33 @@ fn sync_context(hwnd: HWND) {
     }
 }
 // All positions below use content coordinates; only native child windows add SIDE.
+fn field_section(index: usize) -> usize {
+    if index < 7 {
+        0
+    } else if index < PERFORMANCE_FIELD_START {
+        1
+    } else {
+        4
+    }
+}
+fn engine(hwnd: HWND) -> Engine {
+    if unsafe { GetPropW(hwnd, wide("StrataDeepSeek").as_ptr()).is_null() } {
+        Engine::Qwen
+    } else {
+        Engine::DeepSeek
+    }
+}
+fn selected_option(hwnd: HWND) -> Option<usize> {
+    unsafe {
+        let combo = control(hwnd, OPTION);
+        let index = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        if index < 0 {
+            return None;
+        }
+        let option = SendMessageW(combo, CB_GETITEMDATA, index as usize, 0);
+        usize::try_from(option).ok().filter(|i| *i < OPTIONS.len())
+    }
+}
 fn field_rect(index: usize, width: i32) -> RECT {
     let card = (width - 76) / 2;
     let cell = (card - 64) / 2;
@@ -354,14 +474,19 @@ fn field_rect(index: usize, width: i32) -> RECT {
         };
         rect(
             52 + side * (card + 20) + column * (cell + 16),
-            400 + row * 82,
+            390 + row * 76,
             cell,
             38,
         )
     } else {
-        let i = (index - 7) as i32;
+        let start = if index < PERFORMANCE_FIELD_START {
+            7
+        } else {
+            PERFORMANCE_FIELD_START
+        };
+        let i = (index - start) as i32;
         let cell = (width - 152) / 3;
-        rect(52 + (i % 3) * (cell + 24), 400 + (i / 3) * 82, cell, 38)
+        rect(52 + (i % 3) * (cell + 24), 390 + (i / 3) * 76, cell, 38)
     }
 }
 pub fn visible(hwnd: HWND, show: bool) {
@@ -369,14 +494,36 @@ pub fn visible(hwnd: HWND, show: bool) {
     unsafe {
         let section = active_section(hwnd);
         for id in [
-            PROFILE, RUN, STOP, SAVE, RESET, LOG, START_LOG, ENGINE, SAMPLING, ADVANCED,
+            PROFILE,
+            RUN,
+            RUN_EXPERIMENTAL,
+            STOP,
+            SAVE,
+            RESET,
+            LOG,
+            START_LOG,
+            ENGINE,
+            SAMPLING,
+            ADVANCED,
+            CALIBRATION,
+            PERFORMANCE,
         ] {
-            ShowWindow(control(hwnd, id), if show { SW_SHOW } else { SW_HIDE });
+            let available = match id {
+                RUN_EXPERIMENTAL => {
+                    !GetPropW(hwnd, wide("StrataExperimentalAvailable").as_ptr()).is_null()
+                }
+                PERFORMANCE | CALIBRATION => engine(hwnd) == Engine::Qwen,
+                _ => true,
+            };
+            ShowWindow(
+                control(hwnd, id),
+                if show && available { SW_SHOW } else { SW_HIDE },
+            );
         }
         for i in 0..FIELDS.len() {
             ShowWindow(
                 control(hwnd, FIRST_FIELD + i),
-                if show && ((i < 7 && section == 0) || (i >= 7 && section == 1)) {
+                if show && field_section(i) == section && engine(hwnd).supports_field(i) {
                     SW_SHOW
                 } else {
                     SW_HIDE
@@ -390,10 +537,22 @@ pub fn visible(hwnd: HWND, show: bool) {
                 }
             }
         }
-        for id in [ASYNC, PIN, RESIDENT, PARALLEL, PORT, CONTEXT_PRESET] {
+        for id in [
+            ASYNC,
+            PIN,
+            RESIDENT,
+            KV_GROW,
+            KV_STREAM,
+            PARALLEL,
+            PORT,
+            CONTEXT_PRESET,
+        ] {
             ShowWindow(
                 control(hwnd, id),
-                if show && section == 0 {
+                if show
+                    && section == 0
+                    && (engine(hwnd) == Engine::Qwen || [PORT, CONTEXT_PRESET].contains(&id))
+                {
                     SW_SHOW
                 } else {
                     SW_HIDE
@@ -402,7 +561,7 @@ pub fn visible(hwnd: HWND, show: bool) {
         }
         ShowWindow(
             control(hwnd, VISION),
-            if show && IsWindowEnabled(control(hwnd, VISION)) != 0 {
+            if show && !GetPropW(hwnd, wide("StrataVisionAvailable").as_ptr()).is_null() {
                 SW_SHOW
             } else {
                 SW_HIDE
@@ -416,6 +575,35 @@ pub fn visible(hwnd: HWND, show: bool) {
                 SW_HIDE
             },
         );
+        ShowWindow(
+            control(hwnd, OPTION),
+            if show && section == 2 {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+        let selected = selected_option(hwnd);
+        for (i, option) in OPTIONS.iter().enumerate() {
+            ShowWindow(
+                control(hwnd, FIRST_OPTION + i),
+                if show && section == 2 && selected == Some(i) && option.engine == engine(hwnd) {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
+        }
+        for id in [CALIBRATE, CALIBRATION_LOG, RESET_CALIBRATION] {
+            ShowWindow(
+                control(hwnd, id),
+                if show && section == 3 && engine(hwnd) == Engine::Qwen {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
+        }
         ShowWindow(control(hwnd, EXIT), SW_SHOW);
     }
 }
@@ -440,9 +628,23 @@ pub fn resize(hwnd: HWND) {
         move_control(hwnd, PROFILE, rect(52, 154, (w - 432).max(300), 300));
         move_control(hwnd, RUN, rect(w - 352, 153, 180, 44));
         move_control(hwnd, STOP, rect(w - 156, 153, 104, 44));
-        for i in 0..3 {
-            move_control(hwnd, ENGINE + i, rect(28 + i as i32 * 128, 266, 120, 38));
+        move_control(hwnd, RUN_EXPERIMENTAL, rect(w - 388, 208, 168, 30));
+        let tabs: &[usize] = if engine(hwnd) == Engine::DeepSeek {
+            &[ENGINE, SAMPLING, ADVANCED]
+        } else {
+            &[ENGINE, PERFORMANCE, SAMPLING, ADVANCED, CALIBRATION]
+        };
+        for (i, id) in tabs.iter().enumerate() {
+            let tab_width = (w - 56 - (tabs.len() as i32 - 1) * 8) / tabs.len() as i32;
+            move_control(
+                hwnd,
+                *id,
+                rect(28 + i as i32 * (tab_width + 8), 266, tab_width, 38),
+            );
         }
+        move_control(hwnd, CALIBRATE, rect(52, 592, 180, 40));
+        move_control(hwnd, CALIBRATION_LOG, rect(248, 592, 192, 40));
+        move_control(hwnd, RESET_CALIBRATION, rect(456, 592, 188, 40));
         for (i, field) in FIELDS.iter().enumerate() {
             let r = field_rect(i, w);
             move_control(
@@ -459,19 +661,46 @@ pub fn resize(hwnd: HWND) {
         }
         let card = (w - 76) / 2;
         let cell = (card - 64) / 2;
-        move_control(hwnd, CONTEXT_PRESET, rect(54, 402, 82, 320));
-        move_control(hwnd, PARALLEL, rect(642, 606, (w - 694).min(260), 240));
-        move_control(hwnd, START_LOG, rect(w - 196, 207, 144, 34));
-        move_control(hwnd, PORT, rect(288, 613, 114, 22));
-        for (id, x, y) in [
-            (PIN, 52, 536),
-            (RESIDENT, 52 + cell + 16, 536),
-            (ASYNC, 52 + card + 20 + cell + 16, 488),
-            (VISION, 52, 212),
+        move_control(hwnd, CONTEXT_PRESET, rect(54, 392, 82, 320));
+        move_control(hwnd, PARALLEL, rect(642, 622, (w - 694).min(260), 240));
+        move_control(hwnd, START_LOG, rect(w - 204, 208, 152, 30));
+        move_control(hwnd, PORT, rect(288, 629, 114, 22));
+        for (id, x, y, width) in [
+            (KV_GROW, 52, 510, card - 48),
+            (KV_STREAM, 52, 538, card - 48),
+            (PIN, 52, 566, cell),
+            (RESIDENT, 52 + cell + 16, 566, cell),
+            (VISION, 52, 212, 140),
         ] {
-            move_control(hwnd, id, rect(x, y, 18, 26));
+            move_control(hwnd, id, rect(x, y, width, 26));
         }
-        move_control(hwnd, EXTRA, rect(64, 380, w - 128, 254));
+        move_control(
+            hwnd,
+            ASYNC,
+            rect(54 + card + 20 + cell + 16, 468, cell - 4, 240),
+        );
+        let option_width = (w - 128) * 2 / 3;
+        move_control(hwnd, OPTION, rect(54, 392, option_width - 4, 360));
+        SendMessageW(
+            control(hwnd, OPTION),
+            CB_SETDROPPEDWIDTH,
+            (w - 108) as usize,
+            0,
+        );
+        for (i, option) in OPTIONS.iter().enumerate() {
+            let x = 52 + option_width + 24;
+            let width = w - x - 52;
+            move_control(
+                hwnd,
+                FIRST_OPTION + i,
+                if option.choices().is_empty() {
+                    rect(x + 12, 399, width - 24, 22)
+                } else {
+                    rect(x + 2, 392, width - 4, 240)
+                },
+            );
+        }
+        move_control(hwnd, EXTRA, rect(64, 554, w - 128, 78));
         move_control(hwnd, LOG, rect(28, h - 90, 112, 40));
         move_control(hwnd, RESET, rect(w - 332, h - 90, 112, 40));
         move_control(hwnd, SAVE, rect(w - 204, h - 90, 176, 40));
@@ -488,6 +717,8 @@ pub fn paint(
     launch_detail: &str,
     launch_color: u32,
     stage: usize,
+    calibration: &crate::jobs::Status,
+    calibration_started: Option<f64>,
 ) {
     let Some(profile) = hub.profiles.get(hub.selected) else {
         text(
@@ -508,7 +739,6 @@ pub fn paint(
     };
     let section = active_section(hwnd);
     let card = (width - 76) / 2;
-    let cell = (card - 64) / 2;
     theme::rounded(
         dc,
         rect(28, 112, width - 56, 136),
@@ -517,21 +747,13 @@ pub fn paint(
         16,
     );
     text(dc, rect(52, 126, 450, 24), "MODEL PROFILE", MUTED, fonts[0]);
-    if profile.has_vision {
-        text(
-            dc,
-            rect(82, 212, 100, 26),
-            "Vision support",
-            WHITE,
-            fonts[0],
-        );
-    } else {
+    if !profile.has_vision {
         theme::rounded(dc, rect(52, 212, 96, 26), theme::INPUT, None, 10);
         text(dc, rect(64, 212, 80, 26), "Text only", MUTED, fonts[0]);
     }
     text(
         dc,
-        rect(208, 212, width - 432, 26),
+        rect(208, 212, width - 640, 26),
         launch_detail,
         launch_color,
         fonts[0],
@@ -554,51 +776,84 @@ pub fn paint(
     }
     if section == 0 {
         for (x, title) in [(28, "Memory"), (48 + card, "Generation")] {
-            theme::rounded(dc, rect(x, 320, card, 252), PANEL, Some(theme::BORDER), 16);
+            theme::rounded(dc, rect(x, 320, card, 276), PANEL, Some(theme::BORDER), 12);
             text(dc, rect(x + 24, 336, card - 48, 32), title, WHITE, fonts[2]);
         }
-        for (id, label, x, y) in [
-            (PIN, "Pin by need", 52, 536),
-            (RESIDENT, "Resident experts", 52 + cell + 16, 536),
-            (ASYNC, "Adapt async", 52 + card + 20 + cell + 16, 488),
-        ] {
-            text(dc, rect(x + 30, y, cell - 22, 26), label, WHITE, fonts[0]);
-            let _ = id;
+        if profile.settings.engine == Engine::DeepSeek {
+            text(
+                dc,
+                rect(52, 452, card - 48, 32),
+                "DeepSeek manages its own memory cache.",
+                MUTED,
+                fonts[0],
+            );
+            text(
+                dc,
+                rect(72 + card, 390, card - 48, 32),
+                "DSpark and CPU/GPU tuning: Advanced",
+                MUTED,
+                fonts[0],
+            );
+            text(
+                dc,
+                rect(72 + card, 434, card - 48, 32),
+                "One request at a time; text only.",
+                MUTED,
+                fonts[0],
+            );
+        } else if unsafe { SendMessageW(control(hwnd, KV_STREAM), BM_GETCHECK, 0, 0) }
+            == BST_CHECKED as isize
+        {
+            text(
+                dc,
+                rect(72 + card, 520, card - 48, 26),
+                "Streaming keeps full context in RAM.",
+                MUTED,
+                fonts[0],
+            );
+            text(
+                dc,
+                rect(72 + card, 548, card - 48, 26),
+                "VRAM reserve: at least 1000 MiB.",
+                MUTED,
+                fonts[0],
+            );
         }
-        text(
-            dc,
-            rect(52 + card + 20 + cell + 16, 454, cell, 22),
-            "Adaptation",
-            MUTED,
-            fonts[0],
-        );
+        if profile.settings.engine == Engine::Qwen {
+            let cell = (card - 64) / 2;
+            let x = 52 + card + 20 + cell + 16;
+            text(dc, rect(x, 438, cell, 22), "Adapt async", MUTED, fonts[0]);
+            theme::input_frame(hwnd, ASYNC, dc, rect(x, 466, cell, 38));
+        }
         theme::rounded(
             dc,
-            rect(28, 588, width - 56, 68),
+            rect(28, 608, width - 56, 60),
             PANEL,
             Some(theme::BORDER),
             16,
         );
-        text(dc, rect(52, 604, 140, 36), "Server", WHITE, fonts[2]);
-        text(dc, rect(216, 606, 54, 34), "Port", MUTED, fonts[0]);
-        theme::input_frame(hwnd, PORT, dc, rect(276, 604, 140, 38));
-        text(
-            dc,
-            rect(448, 606, 180, 34),
-            "Concurrent requests",
-            MUTED,
-            fonts[0],
-        );
-        theme::input_frame(
-            hwnd,
-            PARALLEL,
-            dc,
-            rect(640, 604, (width - 690).min(264), 38),
-        );
+        text(dc, rect(52, 620, 140, 36), "Server", WHITE, fonts[2]);
+        text(dc, rect(216, 622, 54, 34), "Port", MUTED, fonts[0]);
+        theme::input_frame(hwnd, PORT, dc, rect(276, 620, 140, 38));
+        if profile.settings.engine == Engine::Qwen {
+            text(
+                dc,
+                rect(448, 622, 180, 34),
+                "Concurrent requests",
+                MUTED,
+                fonts[0],
+            );
+            theme::input_frame(
+                hwnd,
+                PARALLEL,
+                dc,
+                rect(640, 620, (width - 690).min(264), 38),
+            );
+        }
     } else {
         theme::rounded(
             dc,
-            rect(28, 320, width - 56, 336),
+            rect(28, 320, width - 56, 348),
             PANEL,
             Some(theme::BORDER),
             16,
@@ -606,18 +861,27 @@ pub fn paint(
         text(
             dc,
             rect(52, 336, width - 104, 32),
-            if section == 1 {
-                "Default sampling"
-            } else {
-                "Engine arguments"
+            match section {
+                1 => "Default sampling",
+                3 => "Hardware calibration",
+                4 => "Performance tuning",
+                _ => {
+                    if profile.settings.engine == Engine::DeepSeek {
+                        "Advanced: DeepSeek"
+                    } else {
+                        "Advanced: Qwen"
+                    }
+                }
             },
             WHITE,
             fonts[2],
         );
     }
-    if section < 2 {
+    if section == 3 {
+        paint_calibration(dc, profile, fonts, width, calibration, calibration_started);
+    } else if section < 2 || section == 4 {
         for (i, field) in FIELDS.iter().enumerate() {
-            if (i < 7) != (section == 0) {
+            if field_section(i) != section || !profile.settings.engine.supports_field(i) {
                 continue;
             }
             let r = field_rect(i, width);
@@ -640,8 +904,75 @@ pub fn paint(
                 theme::input_frame(hwnd, FIRST_FIELD + i, dc, r);
             }
         }
+        if section == 4 {
+            text(
+                dc,
+                rect(52, 556, width - 104, 32),
+                "Blank fields use engine defaults. MTP minimum probability is in Engine.",
+                MUTED,
+                fonts[0],
+            );
+            text(
+                dc,
+                rect(52, 594, width - 104, 32),
+                "Calibration fills these controls; saved changes apply on the next model launch.",
+                MUTED,
+                fonts[0],
+            );
+        }
     } else {
-        theme::input_frame(hwnd, EXTRA, dc, rect(52, 372, width - 104, 270));
+        let option_width = (width - 128) * 2 / 3;
+        text(
+            dc,
+            rect(52, 364, option_width, 24),
+            "Parameter",
+            MUTED,
+            fonts[0],
+        );
+        text(
+            dc,
+            rect(76 + option_width, 364, width - option_width - 128, 24),
+            "Value",
+            MUTED,
+            fonts[0],
+        );
+        theme::input_frame(hwnd, OPTION, dc, rect(52, 390, option_width, 38));
+        if let Some(index) = selected_option(hwnd) {
+            theme::input_frame(
+                hwnd,
+                FIRST_OPTION + index,
+                dc,
+                rect(76 + option_width, 390, width - option_width - 128, 38),
+            );
+            unsafe {
+                let old = SelectObject(dc, fonts[0]);
+                SetTextColor(dc, MUTED);
+                SetBkMode(dc, TRANSPARENT as i32);
+                DrawTextW(
+                    dc,
+                    wide(OPTIONS[index].help).as_ptr(),
+                    -1,
+                    &mut rect(52, 440, width - 104, 54),
+                    DT_WORDBREAK | DT_NOPREFIX,
+                );
+                SelectObject(dc, old);
+            }
+        }
+        text(
+            dc,
+            rect(52, 496, width - 104, 24),
+            "Blank = engine default. Values stay in this form when you switch parameters.",
+            MUTED,
+            fonts[0],
+        );
+        text(
+            dc,
+            rect(52, 524, width - 104, 24),
+            "Additional engine arguments (JSON array of strings)",
+            MUTED,
+            fonts[0],
+        );
+        theme::input_frame(hwnd, EXTRA, dc, rect(52, 546, width - 104, 96));
     }
     crate::fill(dc, rect(28, height - 112, width - 56, 1), theme::BORDER);
     let notice = if modified(hwnd) {
@@ -658,6 +989,135 @@ pub fn paint(
         if modified(hwnd) { ACCENT } else { MUTED },
         fonts[0],
     );
+}
+
+fn paint_calibration(
+    dc: HDC,
+    profile: &crate::profiles::Profile,
+    fonts: &[HFONT; 4],
+    width: i32,
+    status: &crate::jobs::Status,
+    started: Option<f64>,
+) {
+    text(
+        dc,
+        rect(52, 379, width - 104, 28),
+        "Measure CPU/GPU sharing, CPU workers, speculative decoding and expert caching.",
+        MUTED,
+        fonts[0],
+    );
+    let current = status.busy || status.data["profile"].as_str() == Some(profile.file.as_str());
+    let message = if current {
+        status.message.clone()
+    } else if let Some(last) = &profile.calibration {
+        format!(
+            "Last calibration: {} · {:.1} token/s",
+            last["date"].as_str().unwrap_or(""),
+            last["tok_s"].as_f64().unwrap_or(0.0)
+        )
+    } else {
+        "Ready to calibrate this model. Allow about 15–30 minutes; the engine reloads several times.".into()
+    };
+    unsafe {
+        let old = SelectObject(dc, fonts[0]);
+        SetTextColor(
+            dc,
+            if current && status.error {
+                theme::ERROR
+            } else if status.busy {
+                theme::WARNING
+            } else {
+                ACCENT
+            },
+        );
+        SetBkMode(dc, TRANSPARENT as i32);
+        let mut bounds = rect(52, 428, width - 104, 72);
+        DrawTextW(
+            dc,
+            wide(&message).as_ptr(),
+            -1,
+            &mut bounds,
+            DT_WORDBREAK | DT_NOPREFIX,
+        );
+        SelectObject(dc, old);
+    }
+    let detail = if let Some(started) = started {
+        let elapsed = (crate::data::now() - started).max(0.0) as u64;
+        format!(
+            "{} · elapsed {}:{:02}",
+            status.data["stage"].as_str().unwrap_or("Preparing"),
+            elapsed / 60,
+            elapsed % 60
+        )
+    } else if let Some(last) = &profile.calibration {
+        format!(
+            "Calibrated at {} tokens · {} · {} request slots",
+            last["context"].as_str().unwrap_or("engine default"),
+            if last["vision"].as_bool() == Some(true) {
+                "Vision"
+            } else {
+                "Text"
+            },
+            last["parallel"]
+        )
+    } else {
+        "Results are saved to this hub profile only after a successful run.".into()
+    };
+    text(dc, rect(52, 512, width - 104, 30), &detail, MUTED, fonts[0]);
+    text(
+        dc,
+        rect(52, 548, width - 104, 28),
+        "Requires Strata stopped and saved settings. The model stays stopped afterwards.",
+        MUTED,
+        fonts[0],
+    );
+}
+
+pub fn calibration_controls(hwnd: HWND, hub: &Hub, busy: bool, can_start: bool, has_log: bool) {
+    unsafe {
+        let available = !hub.profiles.is_empty();
+        for id in [
+            PROFILE,
+            SAVE,
+            RESET,
+            ASYNC,
+            PIN,
+            RESIDENT,
+            KV_GROW,
+            KV_STREAM,
+            PARALLEL,
+            PORT,
+            CONTEXT_PRESET,
+            EXTRA,
+        ] {
+            EnableWindow(control(hwnd, id), (available && !busy) as i32);
+        }
+        for index in 0..FIELDS.len() {
+            EnableWindow(
+                control(hwnd, FIRST_FIELD + index),
+                (available && !busy) as i32,
+            );
+        }
+        EnableWindow(control(hwnd, OPTION), (available && !busy) as i32);
+        for index in 0..OPTIONS.len() {
+            EnableWindow(
+                control(hwnd, FIRST_OPTION + index),
+                (available && !busy) as i32,
+            );
+        }
+        EnableWindow(
+            control(hwnd, VISION),
+            (available && !busy && hub.profiles[hub.selected].has_vision) as i32,
+        );
+        let can_start =
+            can_start && available && hub.profiles[hub.selected].settings.engine == Engine::Qwen;
+        EnableWindow(control(hwnd, CALIBRATE), can_start as i32);
+        EnableWindow(control(hwnd, CALIBRATION_LOG), has_log as i32);
+        EnableWindow(
+            control(hwnd, RESET_CALIBRATION),
+            (can_start && available && hub.profiles[hub.selected].calibration.is_some()) as i32,
+        );
+    }
 }
 
 pub fn fill(hwnd: HWND, hub: &Hub) {
@@ -681,7 +1141,64 @@ pub fn fill(hwnd: HWND, hub: &Hub) {
             return;
         };
         RemovePropW(hwnd, wide("StrataNoProfiles").as_ptr());
+        for (name, enabled) in [
+            (
+                "StrataDeepSeek",
+                profile.settings.engine == Engine::DeepSeek,
+            ),
+            ("StrataExperimentalAvailable", profile.has_experimental),
+        ] {
+            if enabled {
+                SetPropW(hwnd, wide(name).as_ptr(), 1usize as HANDLE);
+            } else {
+                RemovePropW(hwnd, wide(name).as_ptr());
+            }
+        }
+        if profile.settings.engine == Engine::DeepSeek && [3, 4].contains(&active_section(hwnd)) {
+            SetWindowLongPtrW(control(hwnd, ENGINE), GWLP_USERDATA, 0);
+        }
+        if profile.has_vision {
+            SetPropW(
+                hwnd,
+                wide("StrataVisionAvailable").as_ptr(),
+                1usize as HANDLE,
+            );
+        } else {
+            RemovePropW(hwnd, wide("StrataVisionAvailable").as_ptr());
+        }
         let settings = &profile.settings;
+        SendMessageW(control(hwnd, OPTION), CB_RESETCONTENT, 0, 0);
+        for (index, option) in OPTIONS
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.engine == settings.engine)
+        {
+            let label = format!("{} ({})", option.label, option.key);
+            let row = SendMessageW(
+                control(hwnd, OPTION),
+                CB_ADDSTRING,
+                0,
+                wide(&label).as_ptr() as LPARAM,
+            );
+            SendMessageW(
+                control(hwnd, OPTION),
+                CB_SETITEMDATA,
+                row as usize,
+                index as isize,
+            );
+        }
+        SendMessageW(control(hwnd, OPTION), CB_SETCURSEL, 0, 0);
+        for (index, option) in OPTIONS.iter().enumerate() {
+            set_text(
+                hwnd,
+                FIRST_OPTION + index,
+                settings
+                    .advanced
+                    .get(option.key)
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            );
+        }
         set_text(hwnd, PORT, &settings.port.to_string());
         SendMessageW(
             control(hwnd, PARALLEL),
@@ -697,9 +1214,10 @@ pub fn fill(hwnd: HWND, hub: &Hub) {
         }
         sync_context(hwnd);
         for (id, checked) in [
-            (ASYNC, settings.adapt_async),
             (PIN, settings.pin_by_need),
             (RESIDENT, settings.resident),
+            (KV_GROW, settings.kv_grow),
+            (KV_STREAM, settings.kv_stream),
             (VISION, settings.vision),
         ] {
             SendMessageW(
@@ -709,6 +1227,16 @@ pub fn fill(hwnd: HWND, hub: &Hub) {
                 0,
             );
         }
+        SendMessageW(
+            control(hwnd, ASYNC),
+            CB_SETCURSEL,
+            match settings.adapt_async {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+            0,
+        );
         EnableWindow(control(hwnd, VISION), profile.has_vision as i32);
         set_text(
             hwnd,
@@ -731,6 +1259,20 @@ pub fn read(hwnd: HWND) -> Result<Settings> {
         let checked =
             |id| SendMessageW(control(hwnd, id), BM_GETCHECK, 0, 0) == BST_CHECKED as LRESULT;
         let settings = Settings {
+            engine: engine(hwnd),
+            advanced: OPTIONS
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.engine == engine(hwnd))
+                .filter_map(|(index, option)| {
+                    let value = get_text(hwnd, FIRST_OPTION + index).trim().to_owned();
+                    if value.is_empty() {
+                        None
+                    } else {
+                        Some((option.key.to_owned(), value))
+                    }
+                })
+                .collect(),
             port: get_text(hwnd, PORT)
                 .trim()
                 .parse()
@@ -739,9 +1281,16 @@ pub fn read(hwnd: HWND) -> Result<Settings> {
             values: (0..FIELDS.len())
                 .map(|i| get_text(hwnd, FIRST_FIELD + i).trim().to_owned())
                 .collect(),
-            adapt_async: checked(ASYNC),
+            adapt_async: match SendMessageW(control(hwnd, ASYNC), CB_GETCURSEL, 0, 0) {
+                0 => None,
+                1 => Some(true),
+                2 => Some(false),
+                _ => return Err("Select Auto, On or Off for Adapt async".into()),
+            },
             pin_by_need: checked(PIN),
             resident: checked(RESIDENT),
+            kv_grow: checked(KV_GROW),
+            kv_stream: checked(KV_STREAM),
             vision: checked(VISION),
             extra_args: get_text(hwnd, EXTRA),
         };
