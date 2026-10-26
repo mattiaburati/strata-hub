@@ -42,7 +42,8 @@ try {
         cargo build --release --locked
         if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
     }
-    $executable = Join-Path $PSScriptRoot 'target\release\strata-dashboard.exe'
+    $targetDirectory = if ($env:CARGO_TARGET_DIR) { [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR) } else { Join-Path $PSScriptRoot 'target' }
+    $executable = Join-Path $targetDirectory 'release\strata-dashboard.exe'
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw 'Build the release executable first.' }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $destination = Join-Path ([IO.Path]::GetFullPath($OutputDirectory)) $stamp
@@ -62,7 +63,7 @@ try {
         New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $target
     }
-    foreach ($name in @('README.md', 'PUBLISHING.md', 'Start-StrataHub.bat', 'Open-Settings.bat', 'hub-settings.example.json')) {
+    foreach ($name in @('README.md', 'PUBLISHING.md', 'ADVANCED.md', 'UPDATES.md', 'Start-StrataHub.bat', 'Open-Settings.bat', 'hub-settings.example.json')) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $release
     }
     foreach ($name in @('LICENSE', 'NOTICE')) {
