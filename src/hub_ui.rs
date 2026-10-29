@@ -2,7 +2,9 @@ use crate::{
     ACCENT, MUTED, PANEL, WHITE,
     data::Result,
     engine_options::{Engine, OPTIONS},
-    profiles::{FIELDS, Hub, PERFORMANCE_FIELD_START, Settings},
+    profiles::{
+        ENVIRONMENT_SCOPES, FIELDS, Hub, PERFORMANCE_FIELD_START, Settings, parse_environment,
+    },
     rect, text, theme, wide,
 };
 use std::ptr::null;
@@ -34,6 +36,8 @@ pub const CALIBRATION_LOG: usize = 316;
 pub const RESET_CALIBRATION: usize = 317;
 pub const PERFORMANCE: usize = 318;
 pub const RUN_EXPERIMENTAL: usize = 319;
+pub const ENVIRONMENT: usize = 320;
+pub const ENVIRONMENT_HELP: usize = 321;
 const ASYNC: usize = 350;
 const PIN: usize = 351;
 const RESIDENT: usize = 352;
@@ -57,6 +61,9 @@ const CONTEXT_PRESETS: &[(&str, &str)] = &[
 ];
 const EXTRA: usize = 360;
 const OPTION: usize = 361;
+const ENVIRONMENT_SCOPE: usize = 362;
+const FIRST_INHERIT: usize = 370;
+const FIRST_ENVIRONMENT: usize = 380;
 const FIRST_FIELD: usize = 400;
 const FIRST_OPTION: usize = 500;
 fn control(hwnd: HWND, id: usize) -> HWND {
@@ -290,6 +297,49 @@ pub fn create(hwnd: HWND, hub: &Hub, fonts: &[HFONT; 4]) -> Result<()> {
         )?;
         SendMessageW(port, EM_SETLIMITTEXT, 5, 0);
         SendMessageW(extra, EM_SETLIMITTEXT, 32768, 0);
+        let scopes = add(
+            hwnd,
+            ENVIRONMENT_SCOPE,
+            "COMBOBOX",
+            "",
+            CBS_DROPDOWNLIST as u32
+                | CBS_OWNERDRAWFIXED as u32
+                | CBS_HASSTRINGS as u32
+                | WS_VSCROLL,
+            fonts[0],
+        )?;
+        for (index, label) in ENVIRONMENT_SCOPES.iter().enumerate() {
+            let row = SendMessageW(scopes, CB_ADDSTRING, 0, wide(label).as_ptr() as LPARAM);
+            SendMessageW(scopes, CB_SETITEMDATA, row as usize, index as isize);
+        }
+        SendMessageW(scopes, CB_SETCURSEL, 0, 0);
+        for index in 0..ENVIRONMENT_SCOPES.len() {
+            let editor = add(
+                hwnd,
+                FIRST_ENVIRONMENT + index,
+                "EDIT",
+                "",
+                WS_VSCROLL
+                    | WS_HSCROLL
+                    | ES_MULTILINE as u32
+                    | ES_AUTOVSCROLL as u32
+                    | ES_AUTOHSCROLL as u32
+                    | ES_WANTRETURN as u32,
+                fonts[3],
+            )?;
+            SendMessageW(editor, EM_SETLIMITTEXT, 32768, 0);
+        }
+        for index in 0..2 {
+            let checkbox = add(
+                hwnd,
+                FIRST_INHERIT + index,
+                "BUTTON",
+                "Inherit standard environment",
+                BS_AUTOCHECKBOX as u32,
+                fonts[0],
+            )?;
+            theme::checkbox(checkbox)?;
+        }
         for (id, label) in [
             (RUN, "Start standard"),
             (RUN_EXPERIMENTAL, "Start experimental"),
@@ -302,6 +352,8 @@ pub fn create(hwnd: HWND, hub: &Hub, fonts: &[HFONT; 4]) -> Result<()> {
             (ENGINE, "Engine"),
             (SAMPLING, "Sampling"),
             (ADVANCED, "Advanced"),
+            (ENVIRONMENT, "Environment"),
+            (ENVIRONMENT_HELP, "Available variables (?)"),
             (CALIBRATION, "Calibration"),
             (PERFORMANCE, "Performance"),
             (CALIBRATE, "Calibrate model"),
@@ -310,6 +362,8 @@ pub fn create(hwnd: HWND, hub: &Hub, fonts: &[HFONT; 4]) -> Result<()> {
         ] {
             add(hwnd, id, "BUTTON", label, BS_OWNERDRAW as u32, fonts[0])?;
         }
+        crate::environment_help::tooltip(hwnd, control(hwnd, ENVIRONMENT_HELP))?;
+        crate::gpu_ui::create(hwnd, fonts[0])?;
         fill(hwnd, hub);
         Ok(())
     }
@@ -322,7 +376,15 @@ pub fn select_section(hwnd: HWND, section: usize) {
         SetWindowLongPtrW(control(hwnd, ENGINE), GWLP_USERDATA, section as isize);
         resize(hwnd);
         visible(hwnd, true);
-        for id in [ENGINE, SAMPLING, ADVANCED, CALIBRATION, PERFORMANCE] {
+        for id in [
+            ENGINE,
+            SAMPLING,
+            ADVANCED,
+            CALIBRATION,
+            PERFORMANCE,
+            ENVIRONMENT,
+            crate::gpu_ui::TAB,
+        ] {
             InvalidateRect(control(hwnd, id), null(), 0);
         }
         InvalidateRect(hwnd, null(), 0);
@@ -346,8 +408,11 @@ pub fn saved(hwnd: HWND) {
     }
 }
 pub fn edit_notification(hwnd: HWND, id: usize, notification: u32) -> bool {
+    if crate::gpu_ui::notification(hwnd, id, notification) {
+        return true;
+    }
     unsafe {
-        if id == OPTION {
+        if id == OPTION || id == ENVIRONMENT_SCOPE {
             if notification == CBN_SELCHANGE {
                 visible(hwnd, true);
                 InvalidateRect(hwnd, null(), 0);
@@ -356,9 +421,12 @@ pub fn edit_notification(hwnd: HWND, id: usize, notification: u32) -> bool {
         }
         let is_field = (FIRST_FIELD..FIRST_FIELD + FIELDS.len()).contains(&id);
         let is_option = (FIRST_OPTION..FIRST_OPTION + OPTIONS.len()).contains(&id);
-        let checkbox = [PIN, RESIDENT, VISION, KV_GROW, KV_STREAM].contains(&id);
+        let is_environment = (FIRST_ENVIRONMENT..FIRST_ENVIRONMENT + 4).contains(&id);
+        let inherit = (FIRST_INHERIT..FIRST_INHERIT + 2).contains(&id);
+        let checkbox = [PIN, RESIDENT, VISION, KV_GROW, KV_STREAM].contains(&id) || inherit;
         if !is_field
             && !is_option
+            && !is_environment
             && !checkbox
             && id != EXTRA
             && id != PARALLEL
@@ -395,6 +463,9 @@ pub fn edit_notification(hwnd: HWND, id: usize, notification: u32) -> bool {
         }
         if id == FIRST_FIELD && notification == EN_CHANGE {
             sync_context(hwnd);
+        }
+        if inherit && notification == BN_CLICKED {
+            visible(hwnd, true);
         }
         if matches!(id, KV_GROW | KV_STREAM)
             && notification == BN_CLICKED
@@ -458,6 +529,22 @@ fn selected_option(hwnd: HWND) -> Option<usize> {
         usize::try_from(option).ok().filter(|i| *i < OPTIONS.len())
     }
 }
+fn environment_scope(hwnd: HWND) -> usize {
+    unsafe {
+        let combo = control(hwnd, ENVIRONMENT_SCOPE);
+        let row = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        assert!(row >= 0, "No environment scope selected");
+        let scope = SendMessageW(combo, CB_GETITEMDATA, row as usize, 0);
+        assert!(
+            (0..ENVIRONMENT_SCOPES.len() as isize).contains(&scope),
+            "Invalid environment scope"
+        );
+        scope as usize
+    }
+}
+pub fn open_environment_help(hwnd: HWND, fonts: [HFONT; 4]) -> Result<()> {
+    crate::environment_help::show(hwnd, fonts, engine(hwnd), environment_scope(hwnd))
+}
 fn field_rect(index: usize, width: i32) -> RECT {
     let card = (width - 76) / 2;
     let cell = (card - 64) / 2;
@@ -474,7 +561,7 @@ fn field_rect(index: usize, width: i32) -> RECT {
         };
         rect(
             52 + side * (card + 20) + column * (cell + 16),
-            390 + row * 76,
+            398 + row * 76,
             cell,
             38,
         )
@@ -507,6 +594,8 @@ pub fn visible(hwnd: HWND, show: bool) {
             ADVANCED,
             CALIBRATION,
             PERFORMANCE,
+            ENVIRONMENT,
+            crate::gpu_ui::TAB,
         ] {
             let available = match id {
                 RUN_EXPERIMENTAL => {
@@ -583,6 +672,49 @@ pub fn visible(hwnd: HWND, show: bool) {
                 SW_HIDE
             },
         );
+        ShowWindow(
+            control(hwnd, ENVIRONMENT_SCOPE),
+            if show && section == 5 {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+        ShowWindow(
+            control(hwnd, ENVIRONMENT_HELP),
+            if show && section == 5 {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+        let scope = environment_scope(hwnd);
+        crate::gpu_ui::visible(hwnd, show && section == 6);
+        for index in 0..4 {
+            let editor = control(hwnd, FIRST_ENVIRONMENT + index);
+            let inherited = index % 2 == 1
+                && SendMessageW(control(hwnd, FIRST_INHERIT + index / 2), BM_GETCHECK, 0, 0)
+                    == BST_CHECKED as isize;
+            ShowWindow(
+                editor,
+                if show && section == 5 && scope == index {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
+            EnableWindow(editor, (!inherited) as i32);
+        }
+        for index in 0..2 {
+            ShowWindow(
+                control(hwnd, FIRST_INHERIT + index),
+                if show && section == 5 && scope == index * 2 + 1 {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
+        }
         let selected = selected_option(hwnd);
         for (i, option) in OPTIONS.iter().enumerate() {
             ShowWindow(
@@ -630,9 +762,17 @@ pub fn resize(hwnd: HWND) {
         move_control(hwnd, STOP, rect(w - 156, 153, 104, 44));
         move_control(hwnd, RUN_EXPERIMENTAL, rect(w - 388, 208, 168, 30));
         let tabs: &[usize] = if engine(hwnd) == Engine::DeepSeek {
-            &[ENGINE, SAMPLING, ADVANCED]
+            &[ENGINE, crate::gpu_ui::TAB, SAMPLING, ADVANCED, ENVIRONMENT]
         } else {
-            &[ENGINE, PERFORMANCE, SAMPLING, ADVANCED, CALIBRATION]
+            &[
+                ENGINE,
+                crate::gpu_ui::TAB,
+                PERFORMANCE,
+                SAMPLING,
+                ADVANCED,
+                ENVIRONMENT,
+                CALIBRATION,
+            ]
         };
         for (i, id) in tabs.iter().enumerate() {
             let tab_width = (w - 56 - (tabs.len() as i32 - 1) * 8) / tabs.len() as i32;
@@ -642,6 +782,7 @@ pub fn resize(hwnd: HWND) {
                 rect(28 + i as i32 * (tab_width + 8), 266, tab_width, 38),
             );
         }
+        crate::gpu_ui::resize(hwnd, w);
         move_control(hwnd, CALIBRATE, rect(52, 592, 180, 40));
         move_control(hwnd, CALIBRATION_LOG, rect(248, 592, 192, 40));
         move_control(hwnd, RESET_CALIBRATION, rect(456, 592, 188, 40));
@@ -661,15 +802,15 @@ pub fn resize(hwnd: HWND) {
         }
         let card = (w - 76) / 2;
         let cell = (card - 64) / 2;
-        move_control(hwnd, CONTEXT_PRESET, rect(54, 392, 82, 320));
-        move_control(hwnd, PARALLEL, rect(642, 622, (w - 694).min(260), 240));
+        move_control(hwnd, CONTEXT_PRESET, rect(54, 400, 82, 320));
+        move_control(hwnd, PARALLEL, rect(642, 634, (w - 694).min(260), 240));
         move_control(hwnd, START_LOG, rect(w - 204, 208, 152, 30));
-        move_control(hwnd, PORT, rect(288, 629, 114, 22));
+        move_control(hwnd, PORT, rect(288, 641, 114, 22));
         for (id, x, y, width) in [
-            (KV_GROW, 52, 510, card - 48),
-            (KV_STREAM, 52, 538, card - 48),
-            (PIN, 52, 566, cell),
-            (RESIDENT, 52 + cell + 16, 566, cell),
+            (KV_GROW, 52, 522, card - 48),
+            (KV_STREAM, 52, 550, card - 48),
+            (PIN, 52, 578, cell),
+            (RESIDENT, 52 + cell + 16, 578, cell),
             (VISION, 52, 212, 140),
         ] {
             move_control(hwnd, id, rect(x, y, width, 26));
@@ -677,7 +818,7 @@ pub fn resize(hwnd: HWND) {
         move_control(
             hwnd,
             ASYNC,
-            rect(54 + card + 20 + cell + 16, 468, cell - 4, 240),
+            rect(54 + card + 20 + cell + 16, 476, cell - 4, 240),
         );
         let option_width = (w - 128) * 2 / 3;
         move_control(hwnd, OPTION, rect(54, 392, option_width - 4, 360));
@@ -701,6 +842,14 @@ pub fn resize(hwnd: HWND) {
             );
         }
         move_control(hwnd, EXTRA, rect(64, 554, w - 128, 78));
+        move_control(hwnd, ENVIRONMENT_SCOPE, rect(54, 380, 300, 240));
+        move_control(hwnd, ENVIRONMENT_HELP, rect(w - 264, 334, 212, 32));
+        for index in 0..4 {
+            move_control(hwnd, FIRST_ENVIRONMENT + index, rect(64, 464, w - 128, 110));
+        }
+        for index in 0..2 {
+            move_control(hwnd, FIRST_INHERIT + index, rect(384, 382, w - 436, 26));
+        }
         move_control(hwnd, LOG, rect(28, h - 90, 112, 40));
         move_control(hwnd, RESET, rect(w - 332, h - 90, 112, 40));
         move_control(hwnd, SAVE, rect(w - 204, h - 90, 176, 40));
@@ -714,7 +863,6 @@ pub fn paint(
     fonts: &[HFONT; 4],
     width: i32,
     height: i32,
-    launch_detail: &str,
     launch_color: u32,
     stage: usize,
     calibration: &crate::jobs::Status,
@@ -754,8 +902,23 @@ pub fn paint(
     text(
         dc,
         rect(208, 212, width - 640, 26),
-        launch_detail,
-        launch_color,
+        &format!(
+            "{} · {}",
+            profile.settings.engine.name(),
+            if let Some(devices) = &profile.settings.gpu {
+                format!(
+                    "GPU {}",
+                    devices
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                "Profile GPU settings".into()
+            }
+        ),
+        MUTED,
         fonts[0],
     );
     if stage > 0 {
@@ -776,8 +939,8 @@ pub fn paint(
     }
     if section == 0 {
         for (x, title) in [(28, "Memory"), (48 + card, "Generation")] {
-            theme::rounded(dc, rect(x, 320, card, 276), PANEL, Some(theme::BORDER), 12);
-            text(dc, rect(x + 24, 336, card - 48, 32), title, WHITE, fonts[2]);
+            theme::rounded(dc, rect(x, 320, card, 288), PANEL, Some(theme::BORDER), 12);
+            text(dc, rect(x + 24, 334, card - 48, 28), title, WHITE, fonts[2]);
         }
         if profile.settings.engine == Engine::DeepSeek {
             text(
@@ -822,23 +985,23 @@ pub fn paint(
         if profile.settings.engine == Engine::Qwen {
             let cell = (card - 64) / 2;
             let x = 52 + card + 20 + cell + 16;
-            text(dc, rect(x, 438, cell, 22), "Adapt async", MUTED, fonts[0]);
-            theme::input_frame(hwnd, ASYNC, dc, rect(x, 466, cell, 38));
+            text(dc, rect(x, 446, cell, 22), "Adapt async", MUTED, fonts[0]);
+            theme::input_frame(hwnd, ASYNC, dc, rect(x, 474, cell, 38));
         }
         theme::rounded(
             dc,
-            rect(28, 608, width - 56, 60),
+            rect(28, 620, width - 56, 60),
             PANEL,
             Some(theme::BORDER),
             16,
         );
-        text(dc, rect(52, 620, 140, 36), "Server", WHITE, fonts[2]);
-        text(dc, rect(216, 622, 54, 34), "Port", MUTED, fonts[0]);
-        theme::input_frame(hwnd, PORT, dc, rect(276, 620, 140, 38));
+        text(dc, rect(52, 632, 140, 36), "Server", WHITE, fonts[2]);
+        text(dc, rect(216, 634, 54, 34), "Port", MUTED, fonts[0]);
+        theme::input_frame(hwnd, PORT, dc, rect(276, 632, 140, 38));
         if profile.settings.engine == Engine::Qwen {
             text(
                 dc,
-                rect(448, 622, 180, 34),
+                rect(448, 634, 180, 34),
                 "Concurrent requests",
                 MUTED,
                 fonts[0],
@@ -847,7 +1010,7 @@ pub fn paint(
                 hwnd,
                 PARALLEL,
                 dc,
-                rect(640, 620, (width - 690).min(264), 38),
+                rect(640, 632, (width - 690).min(264), 38),
             );
         }
     } else {
@@ -865,6 +1028,8 @@ pub fn paint(
                 1 => "Default sampling",
                 3 => "Hardware calibration",
                 4 => "Performance tuning",
+                5 => "Environment variables",
+                6 => "GPU selection",
                 _ => {
                     if profile.settings.engine == Engine::DeepSeek {
                         "Advanced: DeepSeek"
@@ -877,7 +1042,9 @@ pub fn paint(
             fonts[2],
         );
     }
-    if section == 3 {
+    if section == 6 {
+        crate::gpu_ui::paint(hwnd, dc, fonts, width);
+    } else if section == 3 {
         paint_calibration(dc, profile, fonts, width, calibration, calibration_started);
     } else if section < 2 || section == 4 {
         for (i, field) in FIELDS.iter().enumerate() {
@@ -920,6 +1087,44 @@ pub fn paint(
                 fonts[0],
             );
         }
+    } else if section == 5 {
+        theme::input_frame(hwnd, ENVIRONMENT_SCOPE, dc, rect(52, 378, 304, 38));
+        text(
+            dc,
+            rect(52, 424, width - 104, 28),
+            "One NAME=value per line. Empty values are allowed; remove a line to remove its override.",
+            MUTED,
+            fonts[0],
+        );
+        let scope = environment_scope(hwnd);
+        theme::input_frame(
+            hwnd,
+            FIRST_ENVIRONMENT + scope,
+            dc,
+            rect(52, 456, width - 104, 128),
+        );
+        text(
+            dc,
+            rect(52, 594, width - 104, 24),
+            if profile.has_experimental {
+                "Experimental environments replace standard ones unless inheritance is enabled."
+            } else {
+                "Engine variables configure inference; server variables configure the Python server."
+            },
+            MUTED,
+            fonts[0],
+        );
+        text(
+            dc,
+            rect(52, 622, width - 104, 24),
+            if profile.settings.engine == Engine::Qwen {
+                "Pin by need / Elastic KV use Engine switches. KV streaming forces STRATA_VRAM_BUDGET=0."
+            } else {
+                "Saved variables apply to this model on its next launch. Windows system settings stay unchanged."
+            },
+            MUTED,
+            fonts[0],
+        );
     } else {
         let option_width = (width - 128) * 2 / 3;
         text(
@@ -1167,6 +1372,51 @@ pub fn fill(hwnd: HWND, hub: &Hub) {
             RemovePropW(hwnd, wide("StrataVisionAvailable").as_ptr());
         }
         let settings = &profile.settings;
+        crate::gpu_ui::fill(hwnd, settings, &profile.gpu_description);
+        let scopes = control(hwnd, ENVIRONMENT_SCOPE);
+        SendMessageW(scopes, CB_RESETCONTENT, 0, 0);
+        for (index, label) in ENVIRONMENT_SCOPES.iter().enumerate() {
+            if index % 2 == 1 && !profile.has_experimental {
+                continue;
+            }
+            let row = SendMessageW(scopes, CB_ADDSTRING, 0, wide(label).as_ptr() as LPARAM);
+            SendMessageW(scopes, CB_SETITEMDATA, row as usize, index as isize);
+        }
+        set_text(
+            hwnd,
+            RUN,
+            if profile.has_experimental {
+                "Start standard"
+            } else {
+                "Start"
+            },
+        );
+        SendMessageW(control(hwnd, ENVIRONMENT_SCOPE), CB_SETCURSEL, 0, 0);
+        for (index, environment) in settings.environment.iter().enumerate() {
+            let value = environment
+                .as_ref()
+                .map(|variables| {
+                    variables
+                        .iter()
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect::<Vec<_>>()
+                        .join("\r\n")
+                })
+                .unwrap_or_default();
+            set_text(hwnd, FIRST_ENVIRONMENT + index, &value);
+            if index % 2 == 1 {
+                SendMessageW(
+                    control(hwnd, FIRST_INHERIT + index / 2),
+                    BM_SETCHECK,
+                    if environment.is_none() {
+                        BST_CHECKED
+                    } else {
+                        BST_UNCHECKED
+                    } as WPARAM,
+                    0,
+                );
+            }
+        }
         SendMessageW(control(hwnd, OPTION), CB_RESETCONTENT, 0, 0);
         for (index, option) in OPTIONS
             .iter()
@@ -1258,8 +1508,26 @@ pub fn read(hwnd: HWND) -> Result<Settings> {
     unsafe {
         let checked =
             |id| SendMessageW(control(hwnd, id), BM_GETCHECK, 0, 0) == BST_CHECKED as LRESULT;
+        let (gpu, gpu_keep_order) = crate::gpu_ui::read(hwnd)?;
         let settings = Settings {
             engine: engine(hwnd),
+            gpu,
+            gpu_keep_order,
+            environment: {
+                let mut environment = [None, None, None, None];
+                for (index, entry) in environment.iter_mut().enumerate() {
+                    let experimental =
+                        !GetPropW(hwnd, wide("StrataExperimentalAvailable").as_ptr()).is_null();
+                    if index % 2 == 0 || (experimental && !checked(FIRST_INHERIT + index / 2)) {
+                        *entry = Some(
+                            parse_environment(&get_text(hwnd, FIRST_ENVIRONMENT + index)).map_err(
+                                |error| format!("{}: {error}", ENVIRONMENT_SCOPES[index]),
+                            )?,
+                        );
+                    }
+                }
+                environment
+            },
             advanced: OPTIONS
                 .iter()
                 .enumerate()

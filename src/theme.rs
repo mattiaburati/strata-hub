@@ -25,10 +25,10 @@ pub fn icon(size: i32) -> HICON {
         ) as HICON
     }
 }
-pub const INPUT: u32 = 0x00221b16;
-pub const BORDER: u32 = 0x004a3d33;
-const SIDE_BG: u32 = 0x001e1814;
-const ACTIVE: u32 = 0x003a4430;
+pub const INPUT: u32 = 0x00231911;
+pub const BORDER: u32 = 0x004e3c2b;
+const SIDE_BG: u32 = 0x00201812;
+const ACTIVE: u32 = 0x00353c20;
 
 pub fn rounded(dc: HDC, r: RECT, color: u32, border: Option<u32>, radius: i32) {
     unsafe {
@@ -135,6 +135,9 @@ pub fn sidebar(dc: HDC, height: i32, fonts: &[HFONT; 4]) {
     }
     text(dc, rect(72, 27, 115, 32), "Strata", WHITE, fonts[2]);
     text(dc, rect(73, 56, 105, 20), "LOCAL HUB", MUTED, fonts[0]);
+    text(dc, rect(24, 110, 150, 20), "WORKSPACE", MUTED, fonts[0]);
+    fill(dc, rect(24, 304, SIDE - 48, 1), BORDER);
+    text(dc, rect(24, 308, 150, 20), "TOOLS", MUTED, fonts[0]);
 }
 pub const WARNING: u32 = 0x006ccbf2;
 pub const ERROR: u32 = 0x008d8df4;
@@ -308,6 +311,14 @@ unsafe extern "system" fn combo_proc(
             RemoveWindowSubclass(hwnd, Some(combo_proc), 1);
         }
         let result = DefSubclassProc(hwnd, msg, w, l);
+        if msg == WM_WINDOWPOSCHANGED
+            && GetFocus() != hwnd
+            && IsChild(hwnd, GetFocus()) == 0
+            && GetWindowLongPtrW(hwnd, GWL_STYLE) & 3 == CBS_DROPDOWN as isize
+        {
+            // Resizing an editable native combo can select its text even without focus.
+            SendMessageW(hwnd, CB_SETEDITSEL, 0, 0);
+        }
         if msg == WM_PAINT {
             let dc = GetDC(hwnd);
             let mut bounds: RECT = std::mem::zeroed();
@@ -379,7 +390,11 @@ pub fn draw_item(parent: HWND, item: &DRAWITEMSTRUCT) -> LRESULT {
                 dc,
                 rect(r.left + 10, r.top, r.right - r.left - 18, r.bottom - r.top),
                 &label,
-                WHITE,
+                if item.itemState & ODS_DISABLED != 0 {
+                    MUTED
+                } else {
+                    WHITE
+                },
                 font,
             );
             return 1;
@@ -400,9 +415,13 @@ pub fn draw_item(parent: HWND, item: &DRAWITEMSTRUCT) -> LRESULT {
             310..=312 => crate::hub_ui::active_section(parent) == id - 310,
             314 => crate::hub_ui::active_section(parent) == 3,
             318 => crate::hub_ui::active_section(parent) == 4,
+            320 => crate::hub_ui::active_section(parent) == 5,
+            322 => crate::hub_ui::active_section(parent) == 6,
             _ => false,
         };
-        let tab = (101..=104).contains(&id) || (310..=312).contains(&id) || matches!(id, 314 | 318);
+        let tab = (101..=104).contains(&id)
+            || (310..=312).contains(&id)
+            || matches!(id, 314 | 318 | 320 | 322);
         let nav = (110..=115).contains(&id) || id == 306;
         let primary = id == 301
             || (id == 303 && crate::hub_ui::modified(parent))
@@ -422,6 +441,8 @@ pub fn draw_item(parent: HWND, item: &DRAWITEMSTRUCT) -> LRESULT {
             0x002e253b
         } else if selected {
             ACTIVE
+        } else if pressed {
+            INPUT
         } else if nav || tab {
             if nav { SIDE_BG } else { BG }
         } else {
@@ -451,6 +472,15 @@ pub fn draw_item(parent: HWND, item: &DRAWITEMSTRUCT) -> LRESULT {
                 ACCENT,
                 None,
                 3,
+            );
+        }
+        if selected && tab {
+            rounded(
+                dc,
+                rect(r.left + 16, r.bottom - 3, r.right - r.left - 32, 2),
+                ACCENT,
+                None,
+                2,
             );
         }
         let length = GetWindowTextLengthW(item.hwndItem).max(0) as usize;

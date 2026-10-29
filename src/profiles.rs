@@ -15,6 +15,59 @@ pub struct Field {
 
 pub const PERFORMANCE_FIELD_START: usize = 13;
 pub const EXPERIMENTAL_PROFILE: &str = "strata-swift-iq3_s-experimental.json";
+pub const ENVIRONMENT_SCOPES: &[&str] = &[
+    "Standard engine",
+    "Experimental engine",
+    "Standard server",
+    "Experimental server",
+];
+pub type Environment = BTreeMap<String, String>;
+
+fn managed_environment(name: &str) -> bool {
+    ["STRATA_PIN_BY_NEED", "STRATA_KV_GROW"]
+        .iter()
+        .any(|key| name.eq_ignore_ascii_case(key))
+}
+
+fn validate_environment(environment: &Environment) -> Result<()> {
+    let mut names = std::collections::BTreeSet::new();
+    for (name, value) in environment {
+        if name.is_empty()
+            || name.trim() != name
+            || name.contains(['=', '\0', '\r', '\n'])
+            || value.contains(['\0', '\r', '\n'])
+        {
+            return Err("Environment variables require a nonempty name without = and a single-line value without NUL characters".into());
+        }
+        if !names.insert(name.to_uppercase()) {
+            return Err(format!(
+                "Duplicate environment variable: {name} (Windows names are case insensitive)"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+pub fn parse_environment(text: &str) -> Result<Environment> {
+    let mut environment = Environment::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("Environment line {}: expected NAME=value", index + 1))?;
+        if environment
+            .insert(name.to_owned(), value.to_owned())
+            .is_some()
+        {
+            return Err(format!("Duplicate environment variable on line {}", index + 1).into());
+        }
+    }
+    validate_environment(&environment)?;
+    Ok(environment)
+}
 
 pub const FIELDS: &[Field] = &[
     Field {
@@ -135,6 +188,9 @@ const CALIBRATION_FLAGS: &[&str] = &[
 #[derive(Clone)]
 pub struct Settings {
     pub engine: Engine,
+    pub gpu: Option<Vec<u32>>,
+    pub gpu_keep_order: bool,
+    pub environment: [Option<Environment>; 4],
     pub advanced: BTreeMap<String, String>,
     pub values: Vec<String>,
     pub parallel: u32,
@@ -146,6 +202,28 @@ pub struct Settings {
     pub kv_stream: bool,
     pub vision: bool,
     pub extra_args: String,
+}
+
+pub fn parse_gpu_selection(text: &str) -> Result<Vec<u32>> {
+    let devices = text
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            if part.is_empty() || !part.bytes().all(|c| c.is_ascii_digit()) {
+                return Err("Enter GPU indices separated by commas, for example 0,1".into());
+            }
+            part.parse::<u32>().map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if devices
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != devices.len()
+    {
+        return Err("Each GPU index must appear only once".into());
+    }
+    Ok(devices)
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -385,6 +463,33 @@ impl Settings {
         }
         Ok(Self {
             engine,
+            gpu: None,
+            gpu_keep_order: false,
+            environment: {
+                let mut environment = [None, None, None, None];
+                for (index, value) in [
+                    &config["env"],
+                    &config["hub_experimental"]["env"],
+                    &config["server_env"],
+                    &config["hub_experimental"]["server_env"],
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if !value.is_null() || index % 2 == 0 {
+                        let mut variables: Environment = if value.is_null() {
+                            Environment::new()
+                        } else {
+                            serde_json::from_value(value.clone())?
+                        };
+                        if engine == Engine::Qwen && index < 2 {
+                            variables.retain(|name, _| !managed_environment(name));
+                        }
+                        environment[index] = Some(variables);
+                    }
+                }
+                environment
+            },
             advanced,
             values,
             parallel,
@@ -399,7 +504,7 @@ impl Settings {
         })
     }
     fn to_json(&self) -> Value {
-        json!({"advanced":self.advanced,"values":self.values,"parallel":self.parallel,"port":self.port,"adapt_async":self.adapt_async,"pin_by_need":self.pin_by_need,
+        json!({"gpu":self.gpu,"gpu_keep_order":self.gpu_keep_order,"environment":self.environment,"advanced":self.advanced,"values":self.values,"parallel":self.parallel,"port":self.port,"adapt_async":self.adapt_async,"pin_by_need":self.pin_by_need,
         "resident":self.resident,"kv_grow":self.kv_grow,"kv_stream":self.kv_stream,"vision":self.vision,"extra_args":self.extra_args})
     }
     fn from_json(value: &Value, original: &Self) -> Result<Self> {
@@ -451,6 +556,18 @@ impl Settings {
         };
         let result = Self {
             engine: original.engine,
+            gpu: match value.get("gpu") {
+                Some(value) => serde_json::from_value(value.clone())?,
+                None => None,
+            },
+            gpu_keep_order: match value.get("gpu_keep_order") {
+                Some(value) => value.as_bool().ok_or("Invalid saved GPU order")?,
+                None => false,
+            },
+            environment: match value.get("environment") {
+                Some(value) => serde_json::from_value(value.clone())?,
+                None => original.environment.clone(),
+            },
             advanced,
             values,
             parallel,
@@ -474,7 +591,56 @@ impl Settings {
         Ok(result)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(devices) = &self.gpu {
+            parse_gpu_selection(
+                &devices
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )?;
+            if self
+                .advanced
+                .get("--gpu")
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(
+                    "Clear Visible GPU indices in Advanced before using the GPU selector".into(),
+                );
+            }
+            for variables in self.environment.iter().flatten() {
+                if variables.keys().any(|key| {
+                    [
+                        "CUDA_VISIBLE_DEVICES",
+                        "HIP_VISIBLE_DEVICES",
+                        "ROCR_VISIBLE_DEVICES",
+                        "GPU_DEVICE_ORDINAL",
+                    ]
+                    .iter()
+                    .any(|name| key.eq_ignore_ascii_case(name))
+                }) {
+                    return Err("Remove GPU visibility overrides from Environment before using the GPU selector".into());
+                }
+            }
+        }
         engine_options::validate(self.engine, &self.advanced)?;
+        for (index, environment) in self.environment.iter().enumerate() {
+            let Some(environment) = environment else {
+                if index % 2 == 0 {
+                    return Err("Standard environment must be an object".into());
+                }
+                continue;
+            };
+            validate_environment(environment)?;
+            if self.engine == Engine::Qwen
+                && index < 2
+                && environment.keys().any(|name| managed_environment(name))
+            {
+                return Err(
+                    "Use the Engine switches for STRATA_PIN_BY_NEED and STRATA_KV_GROW".into(),
+                );
+            }
+        }
         if self.port == 0 {
             return Err("Server port must be between 1 and 65535".into());
         }
@@ -525,6 +691,15 @@ impl Settings {
         }
         let extra: Vec<String> = serde_json::from_str(&self.extra_args)
             .map_err(|_| "Engine arguments must be a JSON array of strings")?;
+        if self.gpu.is_some()
+            && extra
+                .iter()
+                .any(|arg| arg.split('=').next() == Some("--gpus"))
+        {
+            return Err(
+                "Remove --gpus from Advanced arguments before using the GPU selector".into(),
+            );
+        }
         let custom_resident = self
             .advanced
             .get("--kv-resident")
@@ -559,7 +734,7 @@ impl Settings {
         }
         Ok(())
     }
-    fn apply(&self, config: &mut Value) -> Result<()> {
+    fn apply(&self, config: &mut Value, experimental: bool) -> Result<()> {
         self.validate()?;
         if self.engine != Engine::from_config(config) {
             return Err("Settings belong to a different engine family".into());
@@ -573,6 +748,17 @@ impl Settings {
         }
         if self.vision && !config["vision"].is_object() {
             return Err("This profile has no configured vision projector".into());
+        }
+        for (base, key) in [(0, "env"), (2, "server_env")] {
+            let environment = if experimental {
+                self.environment[base + 1]
+                    .as_ref()
+                    .or(self.environment[base].as_ref())
+            } else {
+                self.environment[base].as_ref()
+            }
+            .ok_or("Missing standard environment")?;
+            config[key] = json!(environment);
         }
         let mut args: Vec<String> = serde_json::from_str(&self.extra_args)?;
         engine_options::append(self.engine, &self.advanced, &mut args);
@@ -623,6 +809,60 @@ impl Settings {
                 .remove("vision");
         }
         config["args"] = json!(args);
+        if let Some(devices) = &self.gpu {
+            if let Some(value) = config.get("user_args").filter(|value| !value.is_null()) {
+                let user_args: Vec<String> = serde_json::from_value(value.clone())?;
+                if user_args.iter().any(|arg| {
+                    matches!(
+                        arg.split('=').next(),
+                        Some("--gpu" | "--gpus" | "--layer-split")
+                    )
+                }) {
+                    return Err("Remove GPU selection and layer split overrides from the source profile's user_args before using the GPU selector".into());
+                }
+            }
+            let split = self
+                .advanced
+                .get("--layer-split")
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty());
+            let boundaries = match split {
+                Some("auto") => None,
+                Some(value) => Some(value.split(',').count()),
+                None => match &config["layer_split"] {
+                    Value::Null => None,
+                    Value::String(value) if value == "auto" => None,
+                    Value::String(value) => Some(value.split(',').count()),
+                    Value::Number(_) => Some(1),
+                    Value::Array(values) => Some(values.len()),
+                    _ => return Err("Invalid source profile layer_split".into()),
+                },
+            };
+            if let Some(boundaries) = boundaries {
+                if boundaries + 1 != devices.len() {
+                    return Err("GPU layer boundaries must match the selected GPU count. Set GPU layer boundaries to auto in Advanced.".into());
+                }
+            }
+            // Clear upstream selection metadata so it cannot override this explicit choice.
+            let object = config.as_object_mut().ok_or("Invalid profile")?;
+            for key in [
+                "gpu_roles",
+                "gpu_cards",
+                "gpu_none",
+                "hip_ordinal",
+                "gpu_order",
+            ] {
+                object.remove(key);
+            }
+            config["gpu"] = if devices.len() == 1 {
+                json!(devices[0])
+            } else {
+                json!(devices)
+            };
+            if self.gpu_keep_order {
+                config["gpu_order"] = json!("as_given");
+            }
+        }
         config["parallel"] = json!(self.parallel);
         config["port"] = json!(self.port);
         if config["env"].is_null() {
@@ -649,6 +889,7 @@ pub struct Profile {
     pub label: String,
     pub path: PathBuf,
     pub settings: Settings,
+    pub gpu_description: String,
     pub has_vision: bool,
     pub has_experimental: bool,
     pub calibration: Option<Value>,
@@ -729,7 +970,9 @@ impl Hub {
                 "cwd":config["cwd"],"tokenizer":config["tokenizer"],"host":config["host"],
                 "port":config["port"],"api_key":config["api_key"],
                 "arguments":serde_json::from_str::<Value>(&original.extra_args)?,
-                "arch":config["arch"],"advanced":original.advanced});
+                "arch":config["arch"],"advanced":original.advanced,
+                "gpu":config["gpu"],"gpu_roles":config["gpu_roles"],"hip_ordinal":config["hip_ordinal"],
+                "gpu_order":config["gpu_order"],"gpu_none":config["gpu_none"]});
             let settings = if let Some(value) = saved["profiles"].get(&file) {
                 let mut settings = Settings::from_json(value, &original)?;
                 // Legacy Advanced arguments replaced the CLI list, but not the profile environment.
@@ -772,6 +1015,20 @@ impl Hub {
                 continue;
             }
             profiles.push(Profile {
+                gpu_description: format!(
+                    "Source profile GPU selection: {}{}.",
+                    if config["gpu"].is_null() {
+                        "automatic".into()
+                    } else {
+                        config["gpu"].to_string()
+                    },
+                    if config["backend"].as_str() == Some("hip") && !config["hip_ordinal"].is_null()
+                    {
+                        format!(" (HIP device {})", config["hip_ordinal"])
+                    } else {
+                        String::new()
+                    }
+                ),
                 aliases: vec![file.clone()],
                 identity,
                 has_vision: vision_config.is_some(),
@@ -990,7 +1247,7 @@ impl Hub {
         if let Some(vision) = &profile.vision_config {
             config["vision"] = vision.clone();
         }
-        profile.settings.apply(&mut config)?;
+        profile.settings.apply(&mut config, experimental)?;
         if config.get("host").is_none() {
             config["host"] = json!("127.0.0.1");
         }
@@ -1125,6 +1382,159 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gpu_selection_roundtrips_and_preserves_source_defaults() -> Result<()> {
+        let source = json!({"port":8082,"args":["--native","model.gguf"],"gpu":[0,1],
+            "gpu_order":"as_given","gpu_roles":{"0":"helper","1":"main"},
+            "gpu_cards":{"0":"fixture"},"hip_ordinal":1,"gpu_none":false,
+            "api_key":["fixture-key"]});
+        let mut settings = Settings::from_config(&source)?;
+        let mut legacy = settings.to_json();
+        legacy.as_object_mut().unwrap().remove("gpu");
+        legacy.as_object_mut().unwrap().remove("gpu_keep_order");
+        settings = Settings::from_json(&legacy, &settings)?;
+        let mut applied = source.clone();
+        settings.apply(&mut applied, false)?;
+        for key in [
+            "gpu",
+            "gpu_order",
+            "gpu_roles",
+            "gpu_cards",
+            "gpu_none",
+            "hip_ordinal",
+        ] {
+            assert_eq!(applied[key], source[key]);
+        }
+        settings.gpu = Some(parse_gpu_selection("2, 0")?);
+        settings.gpu_keep_order = true;
+        settings = Settings::from_json(&settings.to_json(), &settings)?;
+        settings.apply(&mut applied, false)?;
+        assert_eq!(applied["gpu"], json!([2, 0]));
+        assert_eq!(applied["gpu_order"], "as_given");
+        assert_eq!(applied["api_key"], source["api_key"]);
+        for key in ["gpu_roles", "gpu_cards", "gpu_none", "hip_ordinal"] {
+            assert!(applied.get(key).is_none());
+        }
+        settings.gpu = Some(vec![1]);
+        settings.gpu_keep_order = false;
+        settings.apply(&mut applied, false)?;
+        assert_eq!(applied["gpu"], 1);
+        assert!(applied.get("gpu_order").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_selection_rejects_invalid_and_conflicting_choices() -> Result<()> {
+        for text in ["", "0,", "0,0", "-1", "0 1", "all", "4294967296"] {
+            assert!(parse_gpu_selection(text).is_err(), "{text}");
+        }
+        let source = json!({"port":8082,"args":["--layer-split","12"]});
+        let mut settings = Settings::from_config(&source)?;
+        settings.gpu = Some(vec![0]);
+        assert!(settings.apply(&mut source.clone(), false).is_err());
+        settings
+            .advanced
+            .insert("--layer-split".into(), "auto".into());
+        settings.apply(&mut source.clone(), false)?;
+        let numeric_split = json!({"port":8082,"args":[],"layer_split":12});
+        let mut numeric = Settings::from_config(&numeric_split)?;
+        numeric.gpu = Some(vec![0]);
+        assert!(numeric.apply(&mut numeric_split.clone(), false).is_err());
+        settings.advanced.insert("--gpu".into(), "1".into());
+        assert!(settings.validate().is_err());
+        settings.advanced.remove("--gpu");
+        settings.environment[0]
+            .as_mut()
+            .unwrap()
+            .insert("cuda_visible_devices".into(), "1".into());
+        assert!(settings.validate().is_err());
+        let source = json!({"port":8082,"args":[],"arch":"deepseek41"});
+        let mut settings = Settings::from_config(&source)?;
+        settings.gpu = Some(vec![0, 1]);
+        settings.apply(&mut source.clone(), false)?;
+        Ok(())
+    }
+
+    #[test]
+    fn environment_edits_preserve_values_and_reject_invalid_input() -> Result<()> {
+        let variables = parse_environment(
+            "STRATA_STAGER_SLEEP=0.001\r\nEMPTY=\r\nPATH=C:\\some folder\\bin\r\nEQUALS= a=b \r\n\r\n",
+        )?;
+        assert_eq!(variables["EMPTY"], "");
+        assert_eq!(variables["PATH"], "C:\\some folder\\bin");
+        assert_eq!(variables["EQUALS"], " a=b ");
+        for text in [
+            "MISSING",
+            "=value",
+            " NAME=value",
+            "NAME=1\nNAME=2",
+            "Path=1\nPATH=2",
+            "NAME=bad\0value",
+            "NAME=bad\rvalue",
+        ] {
+            assert!(parse_environment(text).is_err());
+        }
+        let mut settings = Settings::from_config(&json!({"port":8080,"args":[]}))?;
+        settings.environment[0] = Some(parse_environment("strata_kv_grow=1")?);
+        assert!(settings.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn environment_settings_round_trip_migrate_and_select_runtime() -> Result<()> {
+        let base = json!({"port":8080,"args":[],
+            "env":{"KEEP":"standard","REMOVE":"old","STRATA_PIN_BY_NEED":"1"},
+            "server_env":{"SERVER":"standard"},
+            "hub_experimental":{"env":{"KEEP":"experimental"},
+                "server_env":{"SERVER":"experimental"}}});
+        let original = Settings::from_config(&base)?;
+        let mut legacy = original.to_json();
+        legacy.as_object_mut().unwrap().remove("environment");
+        assert_eq!(
+            Settings::from_json(&legacy, &original)?.environment,
+            original.environment
+        );
+        let mut settings = original.clone();
+        settings.environment[0] = Some(parse_environment("KEEP=changed\nEMPTY=")?);
+        settings.environment[1] = Some(parse_environment("KEEP=experimental-edited")?);
+        let restored = Settings::from_json(&settings.to_json(), &original)?;
+        for experimental in [false, true] {
+            let mut runtime = base.clone();
+            restored.apply(&mut runtime, experimental)?;
+            assert_eq!(
+                runtime["env"]["KEEP"],
+                if experimental {
+                    "experimental-edited"
+                } else {
+                    "changed"
+                }
+            );
+            assert_eq!(
+                runtime["server_env"]["SERVER"],
+                if experimental {
+                    "experimental"
+                } else {
+                    "standard"
+                }
+            );
+            assert!(runtime["env"].get("REMOVE").is_none());
+            assert_eq!(runtime["env"]["STRATA_PIN_BY_NEED"], "1");
+        }
+        settings.environment[1] = None;
+        settings.environment[3] = None;
+        let mut inherited = base.clone();
+        settings.apply(&mut inherited, true)?;
+        assert_eq!(inherited["env"]["KEEP"], "changed");
+        assert_eq!(inherited["server_env"]["SERVER"], "standard");
+        settings.environment[1] = Some(Environment::new());
+        settings.environment[3] = Some(Environment::new());
+        settings.apply(&mut inherited, true)?;
+        assert!(inherited["env"].get("KEEP").is_none());
+        assert_eq!(inherited["server_env"], json!({}));
+        assert_eq!(base["env"]["REMOVE"], "old");
+        Ok(())
+    }
+
+    #[test]
     fn advanced_adapt_async_preserves_auto_and_legacy_overrides() -> Result<()> {
         let base = json!({"port":8082,"args":["--native","model.gguf"]});
         let original = Settings::from_config(&base)?;
@@ -1135,7 +1545,7 @@ mod tests {
             let restored = Settings::from_json(&settings.to_json(), &original)?;
             assert_eq!(restored.adapt_async, mode);
             let mut applied = base.clone();
-            restored.apply(&mut applied)?;
+            restored.apply(&mut applied, false)?;
             let arguments = args(&applied)?;
             if let Some(enabled) = mode {
                 assert_eq!(
@@ -1167,7 +1577,7 @@ mod tests {
         assert!(!migrated.extra_args.contains("dspark"));
         let reloaded = Settings::from_json(&migrated.to_json(), &original)?;
         let mut applied = base.clone();
-        reloaded.apply(&mut applied)?;
+        reloaded.apply(&mut applied, false)?;
         let arguments = args(&applied)?;
         assert_eq!(argument(&arguments, "--dspark")?, "on");
         assert_eq!(argument(&arguments, "--experts")?, "6");
@@ -1187,12 +1597,12 @@ mod tests {
         assert_eq!(original.advanced["--prompt-cache"], "3");
         let restored = Settings::from_json(&original.to_json(), &original)?;
         let mut applied = base.clone();
-        restored.apply(&mut applied)?;
+        restored.apply(&mut applied, false)?;
         assert_eq!(argument(&args(&applied)?, "--native")?, "model.gguf");
         assert_eq!(Settings::from_config(&applied)?.advanced, original.advanced);
         let mut cleared = restored.clone();
         cleared.advanced.remove("--prompt-cache");
-        cleared.apply(&mut applied)?;
+        cleared.apply(&mut applied, false)?;
         assert!(!args(&applied)?.contains(&"--prompt-cache".into()));
         Ok(())
     }
@@ -1257,7 +1667,7 @@ mod tests {
         assert!(reloaded.kv_stream);
         assert_eq!(reloaded.values, original.values);
         let mut enabled = base.clone();
-        reloaded.apply(&mut enabled)?;
+        reloaded.apply(&mut enabled, false)?;
         assert_eq!(argument(&args(&enabled)?, "--kv-resident")?, "32768");
         assert_eq!(argument(&args(&enabled)?, "--vram-reserve-mib")?, "1000");
         assert_eq!(argument(&args(&enabled)?, "--max-context")?, "131072");
@@ -1268,17 +1678,17 @@ mod tests {
         settings.kv_stream = false;
         // The Hub reads the base profile afresh for each launch.
         let mut disabled = base.clone();
-        settings.apply(&mut disabled)?;
+        settings.apply(&mut disabled, false)?;
         assert!(!args(&disabled)?.iter().any(|v| v == "--kv-resident"));
         assert_eq!(argument(&args(&disabled)?, "--vram-reserve-mib")?, "500");
         assert_eq!(disabled["env"]["STRATA_VRAM_BUDGET"], "1");
         assert_eq!(original.to_json(), Settings::from_config(&base)?.to_json());
         settings.kv_stream = true;
         settings.values[1] = "1500".into();
-        settings.apply(&mut enabled)?;
+        settings.apply(&mut enabled, false)?;
         assert_eq!(argument(&args(&enabled)?, "--vram-reserve-mib")?, "1500");
         settings.values[1].clear();
-        settings.apply(&mut enabled)?;
+        settings.apply(&mut enabled, false)?;
         assert_eq!(argument(&args(&enabled)?, "--vram-reserve-mib")?, "1000");
         settings.kv_grow = true;
         assert!(settings.validate().is_err());
@@ -1322,7 +1732,7 @@ mod tests {
             Some("65536")
         );
         let mut applied = custom.clone();
-        settings.apply(&mut applied)?;
+        settings.apply(&mut applied, false)?;
         assert_eq!(argument(&args(&applied)?, "--kv-resident")?, "65536");
         assert!(applied["env"]["STRATA_VRAM_BUDGET"].is_null());
         Ok(())
@@ -1349,13 +1759,13 @@ mod tests {
         let reloaded = Settings::from_json(&settings.to_json(), &original)?;
         assert!(!reloaded.kv_grow);
         let mut effective = config.clone();
-        reloaded.apply(&mut effective)?;
+        reloaded.apply(&mut effective, false)?;
         assert_eq!(effective["env"]["STRATA_KV_GROW"], "0");
         assert_eq!(effective["env"]["OTHER"], "kept");
         assert!(!args(&effective)?.iter().any(|a| a.contains("kv-grow")));
         assert!(!Settings::from_config(&effective)?.kv_grow);
         settings.kv_grow = true;
-        settings.apply(&mut effective)?;
+        settings.apply(&mut effective, false)?;
         assert_eq!(
             args(&effective)?
                 .iter()
@@ -1385,7 +1795,7 @@ mod tests {
         assert_eq!(result.values[6], "0.5");
         assert_eq!(result.port, settings.port);
         let mut effective = original.clone();
-        result.apply(&mut effective)?;
+        result.apply(&mut effective, false)?;
         let extra = args(&effective)?;
         assert_eq!(argument(&extra, "--pool-workers")?, "4");
         assert_eq!(argument(&extra, "--pcie-frac")?, "0.55");
@@ -1477,7 +1887,7 @@ mod tests {
         );
         let reloaded = Settings::from_json(&settings.to_json(), &defaults)?;
         let mut effective = original.clone();
-        reloaded.apply(&mut effective)?;
+        reloaded.apply(&mut effective, false)?;
         let arguments = args(&effective)?;
         for (field, value) in FIELDS
             .iter()
@@ -1497,7 +1907,7 @@ mod tests {
         edited.values[13] = "0.2".into();
         edited.values[14].clear();
         edited.values[18] = "2".into();
-        edited.apply(&mut effective)?;
+        edited.apply(&mut effective, false)?;
         assert_eq!(argument(&args(&effective)?, "--pcie-frac")?, "0.2");
         assert!(!args(&effective)?.iter().any(|v| v == "--pool-workers"));
         assert_eq!(argument(&args(&effective)?, "--prefill-pipe")?, "2");
@@ -1724,11 +2134,11 @@ mod tests {
         let mut runtime = json!({"args":[], "vision":hub.profiles[0].vision_config});
         let mut settings = hub.profiles[0].settings.clone();
         settings.vision = true;
-        settings.apply(&mut runtime)?;
+        settings.apply(&mut runtime, false)?;
         assert_eq!(runtime["vision"]["model"], "swift.gguf");
         assert!(args(&runtime)?.iter().any(|arg| arg == "--vision"));
         settings.vision = false;
-        settings.apply(&mut runtime)?;
+        settings.apply(&mut runtime, false)?;
         assert!(runtime.get("vision").is_none());
         assert!(!args(&runtime)?.iter().any(|arg| arg == "--vision"));
         Ok(())
@@ -1777,7 +2187,7 @@ mod tests {
         settings.validate()?;
         assert!(settings.values.iter().all(String::is_empty));
         let mut result = original.clone();
-        settings.apply(&mut result)?;
+        settings.apply(&mut result, false)?;
         assert!(result.get("sampling").is_none());
         let arguments = args(&result)?;
         assert!(
@@ -1793,7 +2203,7 @@ mod tests {
             "args":["--pack","deepseek-pack","--max-context","8192","--eos","1","--dspark","auto","--dspark-conf","0.65"]});
         let settings = Settings::from_config(&original)?;
         let mut result = original.clone();
-        settings.apply(&mut result)?;
+        settings.apply(&mut result, false)?;
         let arguments = args(&result)?;
         assert_eq!(argument(&arguments, "--pack")?, "deepseek-pack");
         assert_eq!(argument(&arguments, "--dspark")?, "auto");
@@ -1811,10 +2221,10 @@ mod tests {
         );
         let mut unsupported = settings.clone();
         unsupported.kv_grow = true;
-        assert!(unsupported.apply(&mut original.clone()).is_err());
+        assert!(unsupported.apply(&mut original.clone(), false).is_err());
         unsupported = settings.clone();
         unsupported.values[1] = "1000".into();
-        assert!(unsupported.apply(&mut original.clone()).is_err());
+        assert!(unsupported.apply(&mut original.clone(), false).is_err());
         Ok(())
     }
     #[test]
@@ -1831,7 +2241,7 @@ mod tests {
         let settings =
             Settings::from_json(&settings.to_json(), &Settings::from_config(&original)?)?;
         let mut result = original.clone();
-        settings.apply(&mut result)?;
+        settings.apply(&mut result, false)?;
         let arguments = args(&result)?;
         assert_eq!(argument(&arguments, "--native")?, "model.gguf");
         assert!(

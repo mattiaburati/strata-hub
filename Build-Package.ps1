@@ -54,10 +54,10 @@ try {
     $files = @('Cargo.toml', 'Cargo.lock', 'build.rs', '.gitignore', '.gitattributes', 'README.md',
         'PUBLISHING.md', 'ADVANCED.md', 'UPDATES.md', 'Build-Package.ps1', 'hub-settings.example.json', 'Start-StrataHub.bat', 'Open-Settings.bat',
         'src/config.rs', 'src/data.rs', 'src/engine_options.rs', 'src/hub_ui.rs', 'src/installer.rs', 'src/jobs.rs', 'src/launch.rs',
-        'src/main.rs', 'src/models_ui.rs', 'src/profiles.rs', 'src/resources.rs', 'src/settings_ui.rs', 'src/theme.rs', 'src/tools_ui.rs',
+        'src/main.rs', 'src/models_ui.rs', 'src/profiles.rs', 'src/resources.rs', 'src/settings_ui.rs', 'src/theme.rs', 'src/tools_ui.rs', 'src/environment_help.rs', 'src/gpu_ui.rs',
         'scripts/agents.py', 'scripts/model_library.py', 'scripts/update_strata.py', 'scripts/calibrate_model.py', 'scripts/install_strata.ps1', 'scripts/Export-LogoIcon.ps1',
-        'tests/test_tools.py', 'tests/test_updates.py', 'assets/schema.sql', 'assets/qwen-pricing.json', 'assets/logo-prompt.md',
-        'assets/strata-hub-logo.png', 'assets/strata-hub.ico')
+        'scripts/detect_gpus.py', 'tests/test_tools.py', 'tests/test_updates.py', 'assets/schema.sql', 'assets/qwen-pricing.json', 'assets/logo-prompt.md',
+        'assets/strata-hub-logo.png', 'assets/strata-hub.ico', 'assets/environment-variables.tsv')
     foreach ($name in $files) {
         $target = Join-Path $source $name
         New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null

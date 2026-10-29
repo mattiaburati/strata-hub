@@ -2,6 +2,8 @@
 mod config;
 mod data;
 mod engine_options;
+mod environment_help;
+mod gpu_ui;
 mod hub_ui;
 mod installer;
 mod jobs;
@@ -49,8 +51,8 @@ const UPDATE: u32 = WM_APP + 1;
 const TRAY: u32 = WM_APP + 2;
 const START: u32 = WM_APP + 3;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const BG: u32 = 0x001b1511;
-const PANEL: u32 = 0x002a221c;
+const BG: u32 = 0x001a130e;
+const PANEL: u32 = 0x002b2118;
 const ACCENT: u32 = 0x00b6df76;
 const WHITE: u32 = 0x00f7f1ea;
 const MUTED: u32 = 0x00b9ada3;
@@ -79,6 +81,8 @@ struct App {
     syncing_agent_settings: bool,
     models: jobs::Job,
     calibration: jobs::Job,
+    gpu_scan: jobs::Job,
+    gpu_scan_profile: Option<String>,
     calibration_run: Option<(PathBuf, f64)>,
     library: models_ui::Library,
     installed_version: String,
@@ -488,7 +492,6 @@ fn paint(hwnd: HWND, app: &mut App) {
                 &app.fonts,
                 width,
                 height,
-                &launch_detail,
                 color,
                 app.launch
                     .as_ref()
@@ -1191,6 +1194,11 @@ fn monitor_launch(hwnd: HWND, app: &mut App) {
             && !hub_ui::modified(hwnd),
         log_available,
     );
+    gpu_ui::enabled(
+        hwnd,
+        !app.hub.profiles.is_empty() && !calibrating && !app.models.status().blocks_model,
+        app.gpu_scan.status().busy,
+    );
     if calibrating {
         unsafe {
             InvalidateRect(hwnd, null(), 0);
@@ -1216,12 +1224,12 @@ fn layout_controls(hwnd: HWND) {
         tools_ui::resize(hwnd);
         models_ui::resize(hwnd);
         for (id, y) in [
-            (110, 128),
-            (115, 180),
-            (111, 232),
-            (112, 284),
-            (113, 336),
-            (114, 388),
+            (110, 140),
+            (115, 192),
+            (111, 244),
+            (112, 330),
+            (113, 382),
+            (114, 434),
         ] {
             MoveWindow(GetDlgItem(hwnd, id), 16, y, 168, 44, 1);
         }
@@ -1656,6 +1664,9 @@ fn hub_command(hwnd: HWND, app: &mut App, id: usize, notification: u32) -> Resul
             hub_ui::ADVANCED,
             hub_ui::CALIBRATION,
             hub_ui::PERFORMANCE,
+            hub_ui::ENVIRONMENT,
+            gpu_ui::TAB,
+            hub_ui::ENVIRONMENT_HELP,
             hub_ui::CALIBRATION_LOG,
             hub_ui::LOG,
             hub_ui::START_LOG,
@@ -1701,6 +1712,25 @@ fn hub_command(hwnd: HWND, app: &mut App, id: usize, notification: u32) -> Resul
         hub_ui::ENGINE..=hub_ui::ADVANCED => hub_ui::select_section(hwnd, id - hub_ui::ENGINE),
         hub_ui::CALIBRATION => hub_ui::select_section(hwnd, 3),
         hub_ui::PERFORMANCE => hub_ui::select_section(hwnd, 4),
+        hub_ui::ENVIRONMENT => hub_ui::select_section(hwnd, 5),
+        gpu_ui::TAB => hub_ui::select_section(hwnd, 6),
+        gpu_ui::SCAN => {
+            let profile = &app.hub.profiles[app.hub.selected];
+            let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&profile.path)?)?;
+            let request = serde_json::json!({"backend":config["backend"], "exe":config["exe"], "lib_dirs":config["lib_dirs"]});
+            app.gpu_scan.start(
+                hwnd,
+                include_str!("../scripts/detect_gpus.py"),
+                vec![request.to_string()],
+                false,
+                false,
+                "Detecting GPUs...",
+            )?;
+            app.gpu_scan_profile = Some(profile.file.clone());
+            gpu_ui::clear_scan(hwnd);
+            gpu_ui::scan_status(hwnd, "Detecting GPUs...");
+        }
+        hub_ui::ENVIRONMENT_HELP => hub_ui::open_environment_help(hwnd, app.fonts)?,
         hub_ui::CALIBRATE => start_calibration(hwnd, app)?,
         hub_ui::RESET_CALIBRATION => reset_calibration(hwnd, app)?,
         hub_ui::CALIBRATION_LOG => {
@@ -1878,6 +1908,26 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 let plan_result = {
                     let app = &mut *pointer;
                     poll_calibration(hwnd, app);
+                    if app.gpu_scan_profile.is_some() && !app.gpu_scan.status().busy {
+                        let profile = app.gpu_scan_profile.take();
+                        let status = app.gpu_scan.status();
+                        if profile.as_deref()
+                            == app
+                                .hub
+                                .profiles
+                                .get(app.hub.selected)
+                                .map(|p| p.file.as_str())
+                        {
+                            if status.error {
+                                gpu_ui::scan_status(hwnd, &status.message);
+                                message(hwnd, &status.message);
+                            } else if let Err(error) =
+                                gpu_ui::scan_result(hwnd, &status.data["cards"], &status.message)
+                            {
+                                message(hwnd, &error.to_string());
+                            }
+                        }
+                    }
                     poll_agent_settings(hwnd, app);
                     if app.snapshot.lock().expect("Snapshot mutex poisoned").online
                         && app.hub.notice.starts_with("Starting ")
@@ -2221,7 +2271,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             message(hwnd, &error.to_string());
                         }
                     }
-                    300..=319 => {
+                    300..=323 => {
                         if let Err(error) = hub_command(hwnd, app, id, (w >> 16) as u32) {
                             message(hwnd, &error.to_string());
                         }
@@ -2482,6 +2532,8 @@ fn run() -> Result<()> {
                 "strata-calibration.log",
                 "Ready to calibrate the selected model.",
             ),
+            gpu_scan: jobs::Job::new("strata-gpus.log", "Detect GPUs when needed."),
+            gpu_scan_profile: None,
             calibration_run: None,
             library: models_ui::Library::default(),
             installed_version: serde_json::from_slice::<serde_json::Value>(&std::fs::read(
@@ -2548,7 +2600,7 @@ fn run() -> Result<()> {
             if result < 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            if IsDialogMessageW(hwnd, &msg) == 0 {
+            if !environment_help::translate(hwnd, &msg) && IsDialogMessageW(hwnd, &msg) == 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
